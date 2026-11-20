@@ -141,7 +141,7 @@ pub struct InternetConfig {
     /// HTTP request timeout in seconds; `0` means no timeout.
     #[serde(default)]
     pub timeout: f64,
-    /// Whether TCP connections are permitted (not implemented yet).
+    /// Whether TCP connections are permitted via `component.internet.connect`.
     #[serde(default)]
     pub tcp: bool,
     /// Value sent as the default `User-Agent` request header.

@@ -75,7 +75,7 @@ The minimum needed to boot OpenOS, run scripts, and reproduce in-game behavior:
 - `keyboard` — `key_down`/`key_up`/`clipboard` with OpenComputers key codes
 - `filesystem` — `open`/`read`/`write`/`seek`/`close`, listing, metadata; RO OpenOS root + RW mounts
 - `computer` — `beep`, `getDeviceInfo`, `getProgramLocations`, users
-- `internet` — HTTP(S) `request` with a streaming handle (`read`/`response`/`finishConnect`/`close`)
+- `internet` — HTTP(S) `request` with a streaming handle (`read`/`response`/`finishConnect`/`close`) and raw TCP `connect` sockets
 
 Redstone, modems, robots and other cards are **unplanned** (see [Status](#status)); they can still be
 added through the same component registry.
@@ -154,7 +154,7 @@ internet:
   enabled: true
   # HTTP request timeout in seconds; 0 = no timeout.
   timeout: 30
-  # TCP sockets are not implemented yet.
+  # Whether TCP connections are permitted via component.internet.connect().
   tcp: false
   userAgent: opencomputers/ocplay
 
@@ -222,7 +222,34 @@ Implemented and working end-to-end:
   `system`, `unicode`, `os`).
 - `internet` card: HTTP/HTTPS `request` (GET/POST/custom method, headers, POST
   bodies) with OpenComputers' streaming handle semantics, run on a worker thread.
+  With `internet.tcp: true`, raw TCP sockets through `component.internet.connect`
+  (and the OpenOS `internet.socket`/`internet.open` wrappers) are also available.
 - Script autostart through OpenOS's own `rc` mechanism.
+
+### TCP sockets
+
+`internet.tcp: true` enables the component's `connect(address[, port])` method.
+Addresses may be `host`, `host:port`, `[ipv6]:port`, or a bare IPv6 literal with
+an explicit port; host names and IPv4/IPv6 literals are resolved on a worker
+thread so the Lua machine keeps running. An embedded port wins over the second
+argument, as in OpenComputers.
+
+The returned handle exposes `finishConnect`, `read`, `write`, `close` and `id`:
+
+- `finishConnect():boolean` returns `false` while the connect is pending, `true`
+  once established, and raises an error if the connect failed (resolution
+  failure, refused connection, or the 10 second connect timeout). The configured
+  `internet.timeout` applies to HTTP only.
+- `read([n])` is non-blocking and reads at most `min(n, 2048)` bytes. It returns
+  `""` when no data is available yet and `nil` at EOF or after `close()`.
+- `write(data):number` is non-blocking and returns the number of bytes accepted
+  (`0` when the send buffer is full); retry with the remainder of the payload.
+- `close()` is idempotent and `id()` stays stable for the lifetime of the handle.
+
+TCP is deliberately raw: there is no TLS, proxy support, address allow/deny
+filtering, or connection lifetime accounting. `internet_ready` is not emitted;
+poll `finishConnect`/`read` from the guest (the OpenOS stream wrappers do this
+with `os.sleep(0)`).
 
 ### Tests
 
@@ -230,10 +257,12 @@ Implemented and working end-to-end:
 cargo test        # unit tests + end-to-end tests that boot OpenOS
 ```
 
-Unit tests cover config parsing, URL validation, the mouse→signal mapping and
-screen signal emission. The end-to-end tests run the compiled binary against a
-temporary computer: booting and running a script, an HTTP GET against a local
-server, and the missing-root-filesystem error.
+Unit tests cover config parsing, URL validation, TCP address parsing, the
+mouse→signal mapping and screen signal emission. The end-to-end tests run the
+compiled binary against a temporary computer: booting and running a script, an
+HTTP GET against a local server, a TCP echo round trip (including EOF and
+idempotent close), the TCP-disabled error path, and the missing-root-filesystem
+error.
 
 ### Unplanned
 
@@ -245,8 +274,8 @@ through the component registry). Everything below is a known gap:
   `server` (RPC), `geolyzer`, `motion_sensor`, `transposer`, `trading`, `sign`,
   `navigation`, `piston`, `leash`, `database`, `experience`, `generator`,
   `crafting`, `debug`, and all upgrades.
-- **Internet**: TCP sockets (`internet.connect`, `internet_ready`), proxies, and
-  the allow/deny address filtering rules.
+- **Internet**: `internet_ready` signals, proxies, and the allow/deny address
+  filtering rules.
 - **GPU**: VRAM buffers (`allocateBuffer`, `freeBuffer`, `bitblt`, active
   buffer, buffer memory reporting).
 - **Filesystem**: OpenComputers-style `userdata` file handles (we use integer

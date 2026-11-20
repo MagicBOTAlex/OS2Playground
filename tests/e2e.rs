@@ -3,12 +3,12 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +29,10 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 /// A minimal config that boots the built-in OpenOS and never waits on exit.
 fn base_config(extra_mount: Option<&Path>) -> String {
+    base_config_with_tcp(extra_mount, false)
+}
+
+fn base_config_with_tcp(extra_mount: Option<&Path>, tcp: bool) -> String {
     let mut config = String::from(
         "name: test\n\
          memory: 512\n\
@@ -43,11 +47,12 @@ fn base_config(extra_mount: Option<&Path>) -> String {
             path.display()
         ));
     }
-    config.push_str(
+    config.push_str(&format!(
         "components:\n  keyboard: true\n  mouse: false\n\
-         internet:\n  enabled: true\n  timeout: 30\n\
+         internet:\n  enabled: true\n  timeout: 30\n  tcp: {}\n\
          run:\n  timeout: 0\n  interactive: false\n  terminateDelay: 0\n",
-    );
+        tcp
+    ));
     config
 }
 
@@ -123,6 +128,121 @@ require("computer").shutdown()"#
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("BODY:hello-from-test"), "stdout: {stdout}");
+}
+
+#[test]
+fn internet_tcp_echo_roundtrip() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut request = [0u8; 64];
+        let read = socket.read(&mut request).unwrap_or(0);
+        let mut response = b"ECHO:".to_vec();
+        response.extend_from_slice(&request[..read]);
+        socket.write_all(&response).unwrap();
+        // Signal EOF so the guest's read loop terminates deterministically.
+        let _ = socket.shutdown(Shutdown::Write);
+    });
+
+    let dir = temp_dir("tcp");
+    let config = dir.join("computer.yaml");
+    fs::write(&config, base_config_with_tcp(None, true)).unwrap();
+    let script = dir.join("script.lua");
+    fs::write(
+        &script,
+        format!(
+            r#"local component = require("component")
+local computer = require("computer")
+local socket, reason = component.internet.connect("127.0.0.1", {port})
+if not socket then error(reason) end
+local deadline = computer.uptime() + 5
+while not socket:finishConnect() do
+  if computer.uptime() > deadline then error("connect timeout") end
+  os.sleep(0.01)
+end
+print("TCP_ID:" .. socket.id())
+local written = socket:write("ping")
+print("TCP_WRITTEN:" .. tostring(written))
+local received = ""
+deadline = computer.uptime() + 5
+while true do
+  local chunk = socket:read(64)
+  if chunk == nil then break end
+  received = received .. chunk
+  if computer.uptime() > deadline then error("read timeout") end
+  os.sleep(0.01)
+end
+print("TCP_RECEIVED:" .. received)
+socket:close()
+socket:close()
+print("TCP_AFTER_CLOSE:" .. tostring(socket:read(1) == nil))
+require("computer").shutdown()"#,
+            port = addr.port()
+        ),
+    )
+    .unwrap();
+
+    let output = run_ocplay(&config, Some(&script), &[]);
+    server.join().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(stdout.contains("TCP_ID:ocplay-tcp-"), "stdout: {stdout}");
+    assert!(stdout.contains("TCP_WRITTEN:4"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("TCP_RECEIVED:ECHO:ping"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("TCP_AFTER_CLOSE:true"), "stdout: {stdout}");
+}
+
+#[test]
+fn internet_tcp_disabled_returns_error() {
+    let dir = temp_dir("tcpoff");
+    let config = dir.join("computer.yaml");
+    fs::write(&config, base_config(None)).unwrap();
+    let script = dir.join("script.lua");
+    fs::write(
+        &script,
+        r#"local component = require("component")
+local socket, reason = component.internet.connect("127.0.0.1", 1234)
+print("TCP_DISABLED:" .. tostring(socket) .. ":" .. tostring(reason))
+require("computer").shutdown()"#,
+    )
+    .unwrap();
+
+    let output = run_ocplay(&config, Some(&script), &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("TCP_DISABLED:nil:tcp connections are unavailable"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

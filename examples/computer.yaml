@@ -30,7 +30,7 @@ internet:
   enabled: true
   # HTTP request timeout in seconds; 0 = no timeout.
   timeout: 30
-  # TCP sockets are not implemented yet.
+  # TCP connections via component.internet.connect (disabled by default).
   tcp: false
   userAgent: opencomputers/ocplay
 

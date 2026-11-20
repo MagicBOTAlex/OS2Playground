@@ -152,7 +152,7 @@ has a default, so an empty file `{}` is valid. Full example:
     internet:
       enabled: true          # default true; false makes request() fail
       timeout: 30            # seconds; 0 = no timeout (default 0)
-      tcp: false             # TCP sockets (not implemented; default false)
+      tcp: false             # TCP via component.internet.connect (default false)
       userAgent: opencomputers/ocplay   # default User-Agent header
 
     run:
@@ -299,7 +299,25 @@ Behavior notes:
     - `read` on a response with status >= 400 fails (OpenComputers never exposes
       the error stream), but `response()` still reports the status and headers.
     - Response headers are returned as a table mapping name -> array of strings.
-    - `internet.connect` (TCP) is not implemented; it returns unavailable.
+
+TCP sockets (requires `internet.tcp: true`):
+
+    local socket, reason = component.internet.connect("example.com", 80)
+    -- address may also be "host:port", "[ipv6]:port", or a bare IPv6 literal
+    -- when the port is passed as the second argument.
+
+    socket:finishConnect()    -> false while connecting, true when connected,
+                                 errors if the connection failed/timed out (10s)
+    socket:read([n])          -> up to min(n, 2048) bytes; "" when no data yet;
+                                 nil at EOF or after close()
+    socket:write(data)        -> bytes accepted (0 when the send buffer is full);
+                                 retry with the remainder
+    socket:close()            -> idempotent
+    socket:id()               -> stable unique connection id
+
+    The OpenOS wrappers `internet.socket(address, port)` and
+    `internet.open(address, port)` are also supported. TCP is raw: no TLS,
+    proxies, address filtering, or `internet_ready` signals (poll read instead).
 
 ================================================================================
 9. MOUSE / TOUCH
