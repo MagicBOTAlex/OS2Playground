@@ -66,10 +66,7 @@ impl TextBuffer {
     }
 
     pub fn set_foreground(&mut self, value: i32, is_palette: bool) -> Result<(), String> {
-        let c = Color {
-            value,
-            is_palette,
-        };
+        let c = Color { value, is_palette };
         self.format.validate(c)?;
         if self.foreground != c {
             self.foreground = c;
@@ -79,10 +76,7 @@ impl TextBuffer {
     }
 
     pub fn set_background(&mut self, value: i32, is_palette: bool) -> Result<(), String> {
-        let c = Color {
-            value,
-            is_palette,
-        };
+        let c = Color { value, is_palette };
         self.format.validate(c)?;
         if self.background != c {
             self.background = c;
@@ -135,16 +129,19 @@ impl TextBuffer {
             self.format.pack(fg, bg) & 0xFF00,
             &self.format,
         ) as i32);
-        self.background = Color::rgb(color::unpack_background(
-            self.format.pack(fg, bg),
-            &self.format,
-        ) as i32);
+        self.background =
+            Color::rgb(color::unpack_background(self.format.pack(fg, bg), &self.format) as i32);
         self.revision += 1;
         true
     }
 
     pub fn set_resolution(&mut self, w: i32, h: i32) -> Result<bool, String> {
-        if w < 1 || h < 1 || w > self.max_width || h > self.max_width || w * h > self.max_width * self.max_height {
+        if w < 1
+            || h < 1
+            || w > self.max_width
+            || h > self.max_width
+            || w * h > self.max_width * self.max_height
+        {
             return Err("unsupported resolution".into());
         }
         let size_changed = self.resize(w, h);
@@ -157,7 +154,8 @@ impl TextBuffer {
             return false;
         }
         let mut new_chars = vec![0x20u32; (w * h) as usize];
-        let mut new_colors = vec![self.format.pack(self.foreground, self.background); (w * h) as usize];
+        let mut new_colors =
+            vec![self.format.pack(self.foreground, self.background); (w * h) as usize];
         for y in 0..h.min(self.height) {
             for x in 0..w.min(self.width) {
                 new_chars[(y * w + x) as usize] = self.chars[(y * self.width + x) as usize];
@@ -304,7 +302,9 @@ impl TextBuffer {
                     if ox >= 0 && ox < self.width {
                         let src = self.idx(ox, oy);
                         let dst = self.idx(nx, ny);
-                        if self.chars[dst] != self.chars[src] || self.colors[dst] != self.colors[src] {
+                        if self.chars[dst] != self.chars[src]
+                            || self.colors[dst] != self.colors[src]
+                        {
                             changed = true;
                         }
                         self.chars[dst] = self.chars[src];

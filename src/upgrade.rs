@@ -149,13 +149,16 @@ mod tests {
         assert!(is_nix_store(Path::new(
             "/nix/store/abc-ocplay-0.1.0/bin/ocplay"
         )));
-        assert!(!is_nix_store(Path::new("/home/user/.local/share/ocplay/ocplay")));
+        assert!(!is_nix_store(Path::new(
+            "/home/user/.local/share/ocplay/ocplay"
+        )));
     }
 
     #[test]
     fn release_url_points_at_the_latest_asset() {
         let url = release_url().unwrap();
-        assert!(url.starts_with("https://github.com/MagicBOTAlex/OCPlayground/releases/latest/download/"));
+        assert!(url
+            .starts_with("https://github.com/MagicBOTAlex/OCPlayground/releases/latest/download/"));
         assert!(url.ends_with(".tar.gz"));
     }
 }

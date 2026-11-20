@@ -34,8 +34,8 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
     let config = Config::load(config_path)?;
     let system_dir = config::system_dir()?;
 
-    let machine_src = fs::read_to_string(system_dir.join("machine.lua"))
-        .context("failed to read machine.lua")?;
+    let machine_src =
+        fs::read_to_string(system_dir.join("machine.lua")).context("failed to read machine.lua")?;
     let bios = read_bios(&config, &system_dir)?;
 
     let interactive = {
@@ -129,16 +129,16 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
     // --- components -------------------------------------------------------
     let screen = Rc::new(Screen::new(
         buffer.clone(),
-        (config.gpu.screen.width as f64, config.gpu.screen.height as f64),
+        (
+            config.gpu.screen.width as f64,
+            config.gpu.screen.height as f64,
+        ),
         signals.clone(),
     ));
     let screen_address = registry.borrow_mut().add(screen.clone());
     *screen.address.borrow_mut() = screen_address.clone();
 
-    let gpu = Rc::new(Gpu::new(
-        buffer.clone(),
-        depth_from_tier(config.gpu.tier),
-    ));
+    let gpu = Rc::new(Gpu::new(buffer.clone(), depth_from_tier(config.gpu.tier)));
     let gpu_address = registry.borrow_mut().add(gpu);
     let _ = &gpu_address;
 
@@ -152,11 +152,15 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
     let eeprom_address = registry.borrow_mut().add(eeprom.clone());
 
     let internet = Rc::new(Internet::new(
-        config.internet.enabled,
+        config.internet.http_enabled,
+        config.internet.tcp_enabled,
         config.internet.timeout,
         config.internet.user_agent.clone(),
-        config.internet.tcp,
+        config.internet.max_connections,
+        config.internet.max_read_buffer,
+        config.internet.filtering_rules.clone(),
     ));
+    let internet_component = internet.clone();
     let _internet_address = registry.borrow_mut().add(internet);
 
     // Set the boot device.
@@ -167,10 +171,7 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
             .borrow()
             .entries()
             .iter()
-            .find(|entry| {
-                entry.type_name == "filesystem"
-                    && entry.address == config.eeprom.boot
-            })
+            .find(|entry| entry.type_name == "filesystem" && entry.address == config.eeprom.boot)
             .map(|entry| entry.address.clone())
             .or_else(|| Some(root_address.clone()))
     };
@@ -192,7 +193,13 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
 
     // Write the rc.d autostart now that all component addresses are known.
     if let Some(root_dir) = root_dir.as_ref() {
-        inject_rc(root_dir, &mount_lines, has_script, &script_args, interactive)?;
+        inject_rc(
+            root_dir,
+            &mount_lines,
+            has_script,
+            &script_args,
+            interactive,
+        )?;
     }
 
     // --- machine ----------------------------------------------------------
@@ -208,19 +215,14 @@ pub fn run(config_path: &Path, options: RunOptions) -> Result<i32> {
         screen: buffer.clone(),
         screen_component: screen.clone(),
         keyboard: keyboard.clone(),
+        internet: internet_component,
         users,
     });
 
     let mut machine = Machine::create(host.clone(), &machine_src)?;
     let mut term = Output::new(interactive, interactive && config.components.mouse)?;
 
-    let result = run_loop(
-        &mut machine,
-        &mut term,
-        interactive,
-        timeout,
-        host.start,
-    );
+    let result = run_loop(&mut machine, &mut term, interactive, timeout, host.start);
     let is_tty = term.is_tty();
     // Keep the final screen visible for a moment after the machine stops.
     if config.run.terminate_delay > 0.0 {
@@ -272,7 +274,9 @@ fn run_loop(
     let mut exit_code = 0;
 
     loop {
+        machine.host.internet.poll_signals(&machine.host.signals);
         let step = machine.step(resume_args);
+        machine.host.internet.poll_signals(&machine.host.signals);
         let _ = term.render(&machine.host.screen.borrow());
 
         match step {
@@ -286,6 +290,7 @@ fn run_loop(
                 resume_args = machine.take_signal_args()?;
             }
             Step::Shutdown(reboot) => {
+                machine.host.internet.close_all();
                 if reboot {
                     resume_args = MultiValue::new();
                     continue;
@@ -311,6 +316,7 @@ fn run_loop(
         }
     }
 
+    machine.host.internet.close_all();
     Ok(exit_code)
 }
 
@@ -322,6 +328,7 @@ fn wait_for_signal(
     timeout: f64,
     start: Instant,
 ) -> Result<Option<MultiValue>> {
+    machine.host.internet.poll_signals(&machine.host.signals);
     if !machine.host.signals.borrow().is_empty() {
         return machine
             .take_signal_args()
@@ -362,6 +369,7 @@ fn wait_for_signal(
         }
         let _ = term.render(&machine.host.screen.borrow());
 
+        machine.host.internet.poll_signals(&machine.host.signals);
         if !machine.host.signals.borrow().is_empty() {
             return machine
                 .take_signal_args()
@@ -436,8 +444,8 @@ fn root_path(
 }
 
 fn inject_script(root: &Path, script: &Path, _interactive: bool) -> Result<()> {
-    let contents = fs::read(script)
-        .with_context(|| format!("failed to read script {}", script.display()))?;
+    let contents =
+        fs::read(script).with_context(|| format!("failed to read script {}", script.display()))?;
     let home = root.join("home");
     fs::create_dir_all(&home).ok();
     fs::write(home.join("ocplay_autorun.lua"), contents)

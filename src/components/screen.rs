@@ -68,15 +68,51 @@ impl Screen {
 }
 
 const METHODS: &[MethodInfo] = &[
-    MethodInfo { name: "isOn", direct: true, doc: "function():boolean -- Returns whether the screen is currently on." },
-    MethodInfo { name: "turnOn", direct: true, doc: "function():boolean -- Turns the screen on." },
-    MethodInfo { name: "turnOff", direct: true, doc: "function():boolean -- Turns the screen off." },
-    MethodInfo { name: "getAspectRatio", direct: true, doc: "function():number, number -- The aspect ratio of the screen." },
-    MethodInfo { name: "getKeyboards", direct: true, doc: "function():table -- The list of keyboards attached to the screen." },
-    MethodInfo { name: "isPrecise", direct: true, doc: "function():boolean -- Whether the screen is in high precision mode." },
-    MethodInfo { name: "setPrecise", direct: true, doc: "function(enabled:boolean):boolean -- Set whether to use high precision mode." },
-    MethodInfo { name: "isTouchModeInverted", direct: true, doc: "function():boolean -- Whether touch mode is inverted." },
-    MethodInfo { name: "setTouchModeInverted", direct: true, doc: "function(value:boolean):boolean -- Sets whether to invert touch mode." },
+    MethodInfo {
+        name: "isOn",
+        direct: true,
+        doc: "function():boolean -- Returns whether the screen is currently on.",
+    },
+    MethodInfo {
+        name: "turnOn",
+        direct: true,
+        doc: "function():boolean -- Turns the screen on.",
+    },
+    MethodInfo {
+        name: "turnOff",
+        direct: true,
+        doc: "function():boolean -- Turns the screen off.",
+    },
+    MethodInfo {
+        name: "getAspectRatio",
+        direct: true,
+        doc: "function():number, number -- The aspect ratio of the screen.",
+    },
+    MethodInfo {
+        name: "getKeyboards",
+        direct: true,
+        doc: "function():table -- The list of keyboards attached to the screen.",
+    },
+    MethodInfo {
+        name: "isPrecise",
+        direct: true,
+        doc: "function():boolean -- Whether the screen is in high precision mode.",
+    },
+    MethodInfo {
+        name: "setPrecise",
+        direct: true,
+        doc: "function(enabled:boolean):boolean -- Set whether to use high precision mode.",
+    },
+    MethodInfo {
+        name: "isTouchModeInverted",
+        direct: true,
+        doc: "function():boolean -- Whether touch mode is inverted.",
+    },
+    MethodInfo {
+        name: "setTouchModeInverted",
+        direct: true,
+        doc: "function(value:boolean):boolean -- Sets whether to invert touch mode.",
+    },
 ];
 
 impl Component for Screen {
@@ -153,8 +189,8 @@ impl Component for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{new_signal_queue, SignalQueue};
     use crate::color::ColorDepth;
+    use crate::components::{new_signal_queue, SignalQueue};
     use crate::term::MouseAction;
 
     fn screen() -> (Screen, SignalQueue) {

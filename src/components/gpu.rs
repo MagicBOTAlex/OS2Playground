@@ -78,7 +78,9 @@ impl Component for Gpu {
                         self.max_depth.ordinal().min(buffer.max_depth.ordinal()),
                     );
                     buffer.format = Format::new(depth);
-                    buffer.set_resolution(mw, mh).map_err(mlua::Error::RuntimeError)?;
+                    buffer
+                        .set_resolution(mw, mh)
+                        .map_err(mlua::Error::RuntimeError)?;
                     buffer
                         .set_foreground(0xFFFFFF, false)
                         .map_err(mlua::Error::RuntimeError)?;
@@ -149,7 +151,9 @@ impl Component for Gpu {
                 out.push_back(Value::Integer(old as i64));
             }
             "getDepth" => {
-                out.push_back(Value::Integer(self.buffer.borrow().format.depth.bits() as i64));
+                out.push_back(Value::Integer(
+                    self.buffer.borrow().format.depth.bits() as i64
+                ));
             }
             "setDepth" => {
                 let depth = arg_int32(args, 0)?;

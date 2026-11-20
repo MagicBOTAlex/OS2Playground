@@ -150,12 +150,23 @@ components:
   mouse: true
 
 internet:
-  # Whether the internet card is present and HTTP requests are allowed.
-  enabled: true
+  # Canonical names are enableHttp/enableTcp; `enabled` and `tcp` are aliases.
+  # Both default to true, matching OpenComputers.
+  enabled: true        # alias for enableHttp
+  tcp: true            # alias for enableTcp
   # HTTP request timeout in seconds; 0 = no timeout.
   timeout: 30
-  # Whether TCP connections are permitted via component.internet.connect().
-  tcp: false
+  # First matching rule wins; no match denies access. The defaults deny
+  # private/bogon addresses, so loopback is blocked unless allowed here.
+  filteringRules:
+    - removeme
+    - deny private
+    - deny bogon
+    - allow default
+  # Concurrent HTTP requests plus TCP sockets per card.
+  maxTcpConnections: 4
+  # Maximum bytes returned by one read call (OC's key is filesystem.maxReadBuffer).
+  maxReadBuffer: 2048
   userAgent: opencomputers/ocplay
 
 run:
@@ -222,34 +233,65 @@ Implemented and working end-to-end:
   `system`, `unicode`, `os`).
 - `internet` card: HTTP/HTTPS `request` (GET/POST/custom method, headers, POST
   bodies) with OpenComputers' streaming handle semantics, run on a worker thread.
-  With `internet.tcp: true`, raw TCP sockets through `component.internet.connect`
-  (and the OpenOS `internet.socket`/`internet.open` wrappers) are also available.
+  Raw TCP through `component.internet.connect` (and the OpenOS
+  `internet.socket`/`internet.open` wrappers), OC-style address filtering,
+  per-card connection limits and `internet_ready` signals.
 - Script autostart through OpenOS's own `rc` mechanism.
 
-### TCP sockets
+### Internet card
 
-`internet.tcp: true` enables the component's `connect(address[, port])` method.
-Addresses may be `host`, `host:port`, `[ipv6]:port`, or a bare IPv6 literal with
-an explicit port; host names and IPv4/IPv6 literals are resolved on a worker
-thread so the Lua machine keeps running. An embedded port wins over the second
-argument, as in OpenComputers.
+`enableHttp`/`enableTcp` (aliases: `enabled`/`tcp`) are independent. The card is
+always present; a disabled protocol returns its own error. TCP defaults to
+enabled like OpenComputers. Existing configs still parse: `enabled` controls
+HTTP only, so set both `enabled: false` and `tcp: false` to disable both (or
+deny everything with `filteringRules`). `component.internet.connect`
+accepts `host:port`, `host` plus an explicit port, `scheme://host:port` and
+bracketed IPv6 (`[::1]:port` or `[::1]` plus a port). An embedded port wins over
+the explicit argument. Bare IPv6 literals are rejected, matching OC's `checkUri`.
 
 The returned handle exposes `finishConnect`, `read`, `write`, `close` and `id`:
 
-- `finishConnect():boolean` returns `false` while the connect is pending, `true`
-  once established, and raises an error if the connect failed (resolution
-  failure, refused connection, or the 10 second connect timeout). The configured
-  `internet.timeout` applies to HTTP only.
-- `read([n])` is non-blocking and reads at most `min(n, 2048)` bytes. It returns
-  `""` when no data is available yet and `nil` at EOF or after `close()`.
-- `write(data):number` is non-blocking and returns the number of bytes accepted
-  (`0` when the send buffer is full); retry with the remainder of the payload.
-- `close()` is idempotent and `id()` stays stable for the lifetime of the handle.
+- `finishConnect():boolean` returns `false` while connecting and `true` once
+  connected. A failed connect returns `false` once, then `nil, "connection lost"`;
+  after `close()` it returns `nil, "connection lost"`.
+- `read([n])` is non-blocking and reads at most `maxReadBuffer` bytes. It returns
+  `""` while connecting or when no data is available, plain `nil` at EOF, and
+  `nil, "connection lost"` after close or a hard error.
+- `write(data):number` returns the accepted byte count, `0` while connecting or
+  when the send buffer is full, and `nil, reason` after close or a hard error.
+  The OpenOS stream wrappers busy-spin on `0`; they do not poll `finishConnect`,
+  so `write` only returns `0` for connecting/backpressure, never for a dead socket.
+- `close()` is idempotent, `id()` is stable, and `internet_ready <id>` is emitted
+  when a connected socket becomes readable (repeated after reads drain data).
 
-TCP is deliberately raw: there is no TLS, proxy support, address allow/deny
-filtering, or connection lifetime accounting. `internet_ready` is not emitted;
-poll `finishConnect`/`read` from the guest (the OpenOS stream wrappers do this
-with `os.sleep(0)`).
+`filteringRules` follows OpenComputers: rules are evaluated first-to-last, the
+first match wins, and no match denies access. Supported filters are `all`,
+`default`, `private`, `bogon`, `ipv4`, `ipv6`, `ipv4-embedded-ipv6`,
+`ip:<addr>[/cidr]` and `domain:<name>` (domains resolve once at config load).
+`removeme` is ignored. Invalid rules disable all internet access. HTTP and TCP
+are both filtered, and IPv4 addresses embedded in IPv6 (including NAT64) are
+checked too.
+
+**The default rules deny loopback and private addresses.** Local tests and
+OCShell-style agents must add a rule such as:
+
+```yaml
+internet:
+  filteringRules:
+    - allow ip:127.0.0.1/8
+    - deny private
+    - deny bogon
+    - allow default
+```
+
+or simply `- allow all` in a trusted test environment. `maxTcpConnections`
+(default 4) counts HTTP request handles plus TCP sockets per card and is shared
+between them; closing or failing a handle frees a slot. Sockets are closed when
+the machine stops or reboots.
+
+TCP is deliberately raw: there is no TLS, proxy support, or OC connection
+ownership accounting. `internet.timeout` still applies to HTTP only; TCP
+connects are bounded by a fixed 10 second handshake timeout.
 
 ### Tests
 
@@ -257,12 +299,13 @@ with `os.sleep(0)`).
 cargo test        # unit tests + end-to-end tests that boot OpenOS
 ```
 
-Unit tests cover config parsing, URL validation, TCP address parsing, the
-mouse→signal mapping and screen signal emission. The end-to-end tests run the
-compiled binary against a temporary computer: booting and running a script, an
-HTTP GET against a local server, a TCP echo round trip (including EOF and
-idempotent close), the TCP-disabled error path, and the missing-root-filesystem
-error.
+Unit tests cover config parsing, URL validation, TCP address parsing, filtering
+rules, connection accounting, the mouse→signal mapping and screen signal
+emission. The end-to-end tests run the compiled binary against a temporary
+computer: booting and running a script, an HTTP GET against a local server, a TCP
+echo round trip (dot-call methods, EOF, prompt write-after-close failure), the
+TCP-disabled error path, the shared connection limit, default loopback denial,
+`internet_ready`, and the missing-root-filesystem error.
 
 ### Unplanned
 
@@ -274,8 +317,8 @@ through the component registry). Everything below is a known gap:
   `server` (RPC), `geolyzer`, `motion_sensor`, `transposer`, `trading`, `sign`,
   `navigation`, `piston`, `leash`, `database`, `experience`, `generator`,
   `crafting`, `debug`, and all upgrades.
-- **Internet**: `internet_ready` signals, proxies, and the allow/deny address
-  filtering rules.
+- **Internet**: proxies, OC's asynchronous `http_response` signals, TLS for TCP
+  sockets, and OC's per-computer connection ownership checks.
 - **GPU**: VRAM buffers (`allocateBuffer`, `freeBuffer`, `bitblt`, active
   buffer, buffer memory reporting).
 - **Filesystem**: OpenComputers-style `userdata` file handles (we use integer
@@ -285,7 +328,7 @@ through the component registry). Everything below is a known gap:
   runaway scripts, sandboxed bytecode, and alternate architectures (LuaJ / 5.2 / 5.3).
 - **Front-end**: screen resize handling, the in-game `font.hex` bitmap font,
   audio (`computer.beep`), and multi-screen support.
-- **Other**: save/load of machine state, network filtering config, and CI.
+- **Other**: save/load of machine state and CI.
 
 ## Notes
 

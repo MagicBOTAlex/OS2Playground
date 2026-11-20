@@ -135,15 +135,24 @@ impl Default for ComponentsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InternetConfig {
-    /// Whether the internet card is present and HTTP requests are allowed.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// Whether HTTP requests are allowed. `enabled` is accepted as an alias.
+    #[serde(default = "default_true", rename = "enabled", alias = "enableHttp")]
+    pub http_enabled: bool,
+    /// Whether TCP connections are allowed. `tcp` is accepted as an alias.
+    #[serde(default = "default_true", rename = "tcp", alias = "enableTcp")]
+    pub tcp_enabled: bool,
     /// HTTP request timeout in seconds; `0` means no timeout.
     #[serde(default)]
     pub timeout: f64,
-    /// Whether TCP connections are permitted via `component.internet.connect`.
-    #[serde(default)]
-    pub tcp: bool,
+    /// Address filtering rules, first match wins; no match denies access.
+    #[serde(default = "default_filtering_rules", rename = "filteringRules")]
+    pub filtering_rules: Vec<String>,
+    /// Maximum concurrent HTTP requests plus TCP sockets on this card.
+    #[serde(default = "default_max_connections", rename = "maxTcpConnections")]
+    pub max_connections: usize,
+    /// Maximum bytes returned by a single `read` call.
+    #[serde(default = "default_max_read_buffer", rename = "maxReadBuffer")]
+    pub max_read_buffer: usize,
     /// Value sent as the default `User-Agent` request header.
     #[serde(default = "default_user_agent", rename = "userAgent")]
     pub user_agent: String,
@@ -152,9 +161,12 @@ pub struct InternetConfig {
 impl Default for InternetConfig {
     fn default() -> Self {
         InternetConfig {
-            enabled: true,
+            http_enabled: true,
+            tcp_enabled: true,
             timeout: 0.0,
-            tcp: false,
+            filtering_rules: default_filtering_rules(),
+            max_connections: default_max_connections(),
+            max_read_buffer: default_max_read_buffer(),
             user_agent: default_user_agent(),
         }
     }
@@ -191,9 +203,7 @@ impl Config {
             .with_context(|| format!("failed to read config {}", path.display()))?;
         let mut config: Config = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
-        config
-            .filesystems
-            .retain(|fs| !fs.mount.trim().is_empty());
+        config.filesystems.retain(|fs| !fs.mount.trim().is_empty());
         Ok(config)
     }
 
@@ -267,6 +277,18 @@ fn default_terminate_delay() -> f64 {
 fn default_true() -> bool {
     true
 }
+fn default_filtering_rules() -> Vec<String> {
+    crate::components::internet::DEFAULT_FILTERING_RULES
+        .iter()
+        .map(|rule| rule.to_string())
+        .collect()
+}
+fn default_max_connections() -> usize {
+    crate::components::internet::DEFAULT_MAX_CONNECTIONS
+}
+fn default_max_read_buffer() -> usize {
+    crate::components::internet::DEFAULT_MAX_READ_BUFFER
+}
 fn default_user_agent() -> String {
     "opencomputers/ocplay".into()
 }
@@ -282,8 +304,20 @@ mod tests {
         assert_eq!(config.memory, 512);
         assert_eq!(config.gpu.screen.width, 80);
         assert_eq!(config.gpu.screen.max_depth, 8);
-        assert!(config.internet.enabled);
+        assert!(config.internet.http_enabled);
+        assert!(config.internet.tcp_enabled);
         assert_eq!(config.internet.user_agent, "opencomputers/ocplay");
+        assert_eq!(config.internet.max_connections, 4);
+        assert_eq!(config.internet.max_read_buffer, 2048);
+        assert_eq!(
+            config.internet.filtering_rules,
+            vec![
+                "removeme".to_string(),
+                "deny private".to_string(),
+                "deny bogon".to_string(),
+                "allow default".to_string()
+            ]
+        );
         assert_eq!(config.run.terminate_delay, 5.0);
         assert!(config.components.keyboard);
         assert!(config.components.mouse);
@@ -296,6 +330,10 @@ internet:
   enabled: false
   timeout: 12.5
   tcp: true
+  maxTcpConnections: 9
+  maxReadBuffer: 512
+  filteringRules:
+    - allow ip:127.0.0.1/8
   userAgent: custom/1.0
 components:
   mouse: false
@@ -303,12 +341,30 @@ run:
   terminateDelay: 0
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(!config.internet.enabled);
+        assert!(!config.internet.http_enabled);
         assert_eq!(config.internet.timeout, 12.5);
-        assert!(config.internet.tcp);
+        assert!(config.internet.tcp_enabled);
+        assert_eq!(config.internet.max_connections, 9);
+        assert_eq!(config.internet.max_read_buffer, 512);
+        assert_eq!(
+            config.internet.filtering_rules,
+            vec!["allow ip:127.0.0.1/8"]
+        );
         assert_eq!(config.internet.user_agent, "custom/1.0");
         assert!(!config.components.mouse);
         assert_eq!(config.run.terminate_delay, 0.0);
+    }
+
+    #[test]
+    fn accepts_canonical_internet_flag_names() {
+        let yaml = r#"
+internet:
+  enableHttp: false
+  enableTcp: false
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.internet.http_enabled);
+        assert!(!config.internet.tcp_enabled);
     }
 
     #[test]

@@ -8,8 +8,7 @@
 use std::time::Duration;
 
 /// Raw GitHub URL of the reference document on the default branch.
-pub const URL: &str =
-    "https://raw.githubusercontent.com/MagicBOTAlex/OCPlayground/master/llm.md";
+pub const URL: &str = "https://raw.githubusercontent.com/MagicBOTAlex/OCPlayground/master/llm.md";
 
 /// The URL that will actually be fetched, honouring `OCPLAY_LLM_URL`.
 pub fn url() -> String {

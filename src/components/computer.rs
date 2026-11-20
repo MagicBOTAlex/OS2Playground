@@ -15,7 +15,11 @@ pub struct Computer {
 }
 
 impl Computer {
-    pub fn new(address: String, registry: SharedRegistry, users: Rc<RefCell<Vec<String>>>) -> Computer {
+    pub fn new(
+        address: String,
+        registry: SharedRegistry,
+        users: Rc<RefCell<Vec<String>>>,
+    ) -> Computer {
         Computer {
             address,
             registry,
@@ -25,13 +29,41 @@ impl Computer {
 }
 
 const METHODS: &[MethodInfo] = &[
-    MethodInfo { name: "beep", direct: true, doc: "function([frequency:string or number[, duration:number]]) -- Plays a tone." },
-    MethodInfo { name: "getDeviceInfo", direct: true, doc: "function():table -- Collect information on all connected devices." },
-    MethodInfo { name: "getProgramLocations", direct: true, doc: "function():table -- Returns a map of program name to disk label." },
-    MethodInfo { name: "users", direct: true, doc: "function():table -- Returns a list of users." },
-    MethodInfo { name: "addUser", direct: true, doc: "function(name:string) -- Adds a user." },
-    MethodInfo { name: "removeUser", direct: true, doc: "function(name:string) -- Removes a user." },
-    MethodInfo { name: "isRunning", direct: true, doc: "function():boolean -- Returns whether the computer is running." },
+    MethodInfo {
+        name: "beep",
+        direct: true,
+        doc: "function([frequency:string or number[, duration:number]]) -- Plays a tone.",
+    },
+    MethodInfo {
+        name: "getDeviceInfo",
+        direct: true,
+        doc: "function():table -- Collect information on all connected devices.",
+    },
+    MethodInfo {
+        name: "getProgramLocations",
+        direct: true,
+        doc: "function():table -- Returns a map of program name to disk label.",
+    },
+    MethodInfo {
+        name: "users",
+        direct: true,
+        doc: "function():table -- Returns a list of users.",
+    },
+    MethodInfo {
+        name: "addUser",
+        direct: true,
+        doc: "function(name:string) -- Adds a user.",
+    },
+    MethodInfo {
+        name: "removeUser",
+        direct: true,
+        doc: "function(name:string) -- Removes a user.",
+    },
+    MethodInfo {
+        name: "isRunning",
+        direct: true,
+        doc: "function():boolean -- Returns whether the computer is running.",
+    },
 ];
 
 impl Component for Computer {

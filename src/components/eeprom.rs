@@ -34,15 +34,51 @@ impl Eeprom {
 // --------------------------------------------------------------------------- //
 
 const METHODS: &[MethodInfo] = &[
-    MethodInfo { name: "get", direct: true, doc: "function():string -- Get the currently stored byte array." },
-    MethodInfo { name: "set", direct: true, doc: "function(data:string) -- Overwrite the currently stored byte array." },
-    MethodInfo { name: "getLabel", direct: true, doc: "function():string -- Get the label of the EEPROM." },
-    MethodInfo { name: "setLabel", direct: true, doc: "function(data:string):string -- Set the label of the EEPROM." },
-    MethodInfo { name: "getSize", direct: true, doc: "function():number -- Get the storage capacity of this EEPROM." },
-    MethodInfo { name: "getChecksum", direct: true, doc: "function():string -- Get the checksum of the data on this EEPROM." },
-    MethodInfo { name: "getData", direct: true, doc: "function():string -- Get the currently stored boot data." },
-    MethodInfo { name: "setData", direct: true, doc: "function(data:string) -- Overwrite the currently stored boot data." },
-    MethodInfo { name: "getDataSize", direct: true, doc: "function():number -- Get the storage capacity of the boot data." },
+    MethodInfo {
+        name: "get",
+        direct: true,
+        doc: "function():string -- Get the currently stored byte array.",
+    },
+    MethodInfo {
+        name: "set",
+        direct: true,
+        doc: "function(data:string) -- Overwrite the currently stored byte array.",
+    },
+    MethodInfo {
+        name: "getLabel",
+        direct: true,
+        doc: "function():string -- Get the label of the EEPROM.",
+    },
+    MethodInfo {
+        name: "setLabel",
+        direct: true,
+        doc: "function(data:string):string -- Set the label of the EEPROM.",
+    },
+    MethodInfo {
+        name: "getSize",
+        direct: true,
+        doc: "function():number -- Get the storage capacity of this EEPROM.",
+    },
+    MethodInfo {
+        name: "getChecksum",
+        direct: true,
+        doc: "function():string -- Get the checksum of the data on this EEPROM.",
+    },
+    MethodInfo {
+        name: "getData",
+        direct: true,
+        doc: "function():string -- Get the currently stored boot data.",
+    },
+    MethodInfo {
+        name: "setData",
+        direct: true,
+        doc: "function(data:string) -- Overwrite the currently stored boot data.",
+    },
+    MethodInfo {
+        name: "getDataSize",
+        direct: true,
+        doc: "function():number -- Get the storage capacity of the boot data.",
+    },
 ];
 
 impl Component for Eeprom {
@@ -66,11 +102,17 @@ impl Component for Eeprom {
                 let data = arg_bytes(args, 0)?;
                 *self.data.borrow_mut() = data;
             }
-            "getLabel" => out.push_back(Value::String(lua.create_string(self.label.borrow().as_str())?)),
+            "getLabel" => out.push_back(Value::String(
+                lua.create_string(self.label.borrow().as_str())?,
+            )),
             "setLabel" => {
                 let label = opt_string(args, 0, "EEPROM");
                 let label: String = label.trim().chars().take(24).collect();
-                let label = if label.is_empty() { "EEPROM".to_string() } else { label };
+                let label = if label.is_empty() {
+                    "EEPROM".to_string()
+                } else {
+                    label
+                };
                 *self.label.borrow_mut() = label.clone();
                 out.push_back(Value::String(lua.create_string(&label)?));
             }

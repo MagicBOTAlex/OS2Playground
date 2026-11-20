@@ -3,6 +3,7 @@
 //! palette entries + a 240-color RGB cube).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum ColorDepth {
     OneBit,
     FourBit,
@@ -186,7 +187,8 @@ impl Format {
                     let ig = (g as f64 * 7.0 / 0xFF as f64 + 0.5) as u8;
                     let ib = (b as f64 * 4.0 / 0xFF as f64 + 0.5) as u8;
                     let deflated = 16u8.wrapping_add(ir * 40 + ig * 5 + ib);
-                    if delta(self.inflate(deflated), rgb) < delta(self.inflate(palette_index), rgb) {
+                    if delta(self.inflate(deflated), rgb) < delta(self.inflate(palette_index), rgb)
+                    {
                         deflated
                     } else {
                         palette_index

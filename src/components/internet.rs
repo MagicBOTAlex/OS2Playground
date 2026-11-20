@@ -1,20 +1,338 @@
-//! The `internet` component: HTTP(S) requests performed on a background thread,
-//! mirroring the OpenComputers internet card's streaming request handle.
+//! The `internet` component: HTTP(S) requests and raw TCP sockets performed on
+//! background threads, mirroring the OpenComputers internet card.
 
 use super::{arg_bytes, arg_string, multi1, Component, MethodInfo};
+use crate::components::{Signal, SignalArg, SignalQueue};
 use mlua::{Lua, MultiValue, Value, Variadic};
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// OpenComputers clamps every `read` call to this many bytes.
-const MAX_READ_BUFFER: usize = 2048;
+/// OpenComputers clamps every `read` call to this many bytes by default.
+pub const DEFAULT_MAX_READ_BUFFER: usize = 2048;
 
-/// Upper bound for a TCP connect attempt (name resolution runs on the worker
-/// thread as well, so a hung resolver never blocks the Lua machine).
+/// OpenComputers' default for `internet.maxTcpConnections`.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4;
+
+/// OpenComputers' default filtering rules.
+pub const DEFAULT_FILTERING_RULES: &[&str] =
+    &["removeme", "deny private", "deny bogon", "allow default"];
+
+/// Upper bound for a TCP connect attempt.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+const CONNECTION_LOST: &str = "connection lost";
+
+const ADDRESS_PARSE_ERROR: &str = "address could not be parsed or no valid port given";
+
+// ---------------------------------------------------------------------------
+// Address filtering
+
+const BOGON_RANGES: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/3",
+    "::/128",
+    "::1/128",
+    "::ffff:0:0/96",
+    "::/96",
+    "64:ff9b::/96",
+    "100::/64",
+    "2001:10::/28",
+    "2001:db8::/32",
+    "fc00::/7",
+    "fe80::/10",
+    "fec0::/10",
+    "ff00::/8",
+];
+
+#[derive(Clone, Debug)]
+struct IpRange {
+    base: IpAddr,
+    prefix: u8,
+}
+
+impl IpRange {
+    fn parse(text: &str) -> Option<IpRange> {
+        let (address_text, prefix_text) = match text.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (text, None),
+        };
+        let base: IpAddr = address_text.parse().ok()?;
+        let max = match base {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix = match prefix_text {
+            Some(prefix) => prefix.parse::<u8>().ok()?,
+            None => max,
+        };
+        (prefix <= max).then_some(IpRange { base, prefix })
+    }
+
+    fn matches(&self, address: IpAddr) -> bool {
+        match (self.base, address) {
+            (IpAddr::V4(base), IpAddr::V4(address)) => {
+                matches_bytes(&base.octets(), &address.octets(), self.prefix)
+            }
+            (IpAddr::V6(base), IpAddr::V6(address)) => {
+                matches_bytes(&base.octets(), &address.octets(), self.prefix)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn matches_bytes(base: &[u8], address: &[u8], prefix: u8) -> bool {
+    let full = (prefix / 8) as usize;
+    let remainder = prefix % 8;
+    if base[..full] != address[..full] {
+        return false;
+    }
+    if remainder == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - remainder);
+    (base[full] & mask) == (address[full] & mask)
+}
+
+#[derive(Clone, Debug)]
+enum FilterPredicate {
+    All,
+    Never,
+    Default,
+    Private,
+    Bogon,
+    Ipv4,
+    Ipv6,
+    Ipv4EmbeddedIpv6,
+    Ip(IpRange),
+    Domain {
+        name: String,
+        addresses: Vec<IpAddr>,
+    },
+}
+
+impl FilterPredicate {
+    fn matches(&self, address: IpAddr, host: &str, bogon: &[IpRange]) -> bool {
+        match self {
+            FilterPredicate::All => true,
+            FilterPredicate::Never => false,
+            FilterPredicate::Default => !is_private(address) && !is_bogon(address, bogon),
+            FilterPredicate::Private => is_private(address),
+            FilterPredicate::Bogon => is_bogon(address, bogon),
+            FilterPredicate::Ipv4 => matches!(address, IpAddr::V4(_)),
+            FilterPredicate::Ipv6 => matches!(address, IpAddr::V6(_)),
+            FilterPredicate::Ipv4EmbeddedIpv6 => embedded_ipv4(address).is_some(),
+            FilterPredicate::Ip(range) => range.matches(address),
+            FilterPredicate::Domain { name, addresses } => {
+                host.eq_ignore_ascii_case(name) || addresses.contains(&address)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FilterRule {
+    allow: bool,
+    predicates: Vec<FilterPredicate>,
+}
+
+impl FilterRule {
+    fn matches(&self, address: IpAddr, host: &str, bogon: &[IpRange]) -> bool {
+        self.predicates
+            .iter()
+            .all(|predicate| predicate.matches(address, host, bogon))
+    }
+}
+
+/// Compiled `internet.filteringRules`. Any invalid rule disables all access,
+/// matching OpenComputers' `internetAccessAllowed`.
+#[derive(Clone, Debug)]
+pub struct FilterSet {
+    rules: Vec<FilterRule>,
+    invalid: bool,
+    bogon: Vec<IpRange>,
+}
+
+impl FilterSet {
+    pub fn compile(rules: &[String]) -> FilterSet {
+        let bogon: Vec<IpRange> = BOGON_RANGES
+            .iter()
+            .filter_map(|rule| IpRange::parse(rule))
+            .collect();
+        let mut set = FilterSet {
+            rules: Vec::new(),
+            invalid: false,
+            bogon,
+        };
+        for rule in rules {
+            let text = rule.trim();
+            if text.is_empty() || text == "removeme" {
+                continue;
+            }
+            let mut parts = text.split_whitespace();
+            let allow = match parts.next() {
+                Some("allow") => true,
+                Some("deny") => false,
+                _ => {
+                    set.invalid = true;
+                    continue;
+                }
+            };
+            let mut predicates = Vec::new();
+            let mut valid = true;
+            for token in parts {
+                match parse_predicate(token, allow) {
+                    Some(predicate) => predicates.push(predicate),
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                set.rules.push(FilterRule { allow, predicates });
+            } else {
+                set.invalid = true;
+            }
+        }
+        set
+    }
+
+    pub fn invalid(&self) -> bool {
+        self.invalid
+    }
+
+    /// First matching rule wins. No match denies.
+    pub fn is_allowed(&self, address: IpAddr, host: &str) -> bool {
+        if self.invalid {
+            return false;
+        }
+        if let IpAddr::V6(address6) = address {
+            if let Some(embedded) = embedded_ipv4(address) {
+                if self.decide(IpAddr::V4(embedded), host) == Some(false) {
+                    return false;
+                }
+            }
+            if let Some(embedded) = nat64_ipv4(address6) {
+                if self.decide(IpAddr::V4(embedded), host) == Some(false) {
+                    return false;
+                }
+            }
+        }
+        self.decide(address, host).unwrap_or(false)
+    }
+
+    fn decide(&self, address: IpAddr, host: &str) -> Option<bool> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(address, host, &self.bogon))
+            .map(|rule| rule.allow)
+    }
+}
+
+fn parse_predicate(token: &str, allow: bool) -> Option<FilterPredicate> {
+    let (kind, value) = match token.split_once(':') {
+        Some((kind, value)) => (kind, Some(value)),
+        None => (token, None),
+    };
+    match kind {
+        "all" => Some(FilterPredicate::All),
+        "default" => Some(if allow {
+            FilterPredicate::Default
+        } else {
+            FilterPredicate::Never
+        }),
+        "private" => Some(FilterPredicate::Private),
+        "bogon" => Some(FilterPredicate::Bogon),
+        "ipv4" => Some(FilterPredicate::Ipv4),
+        "ipv6" => Some(FilterPredicate::Ipv6),
+        "ipv4-embedded-ipv6" => Some(FilterPredicate::Ipv4EmbeddedIpv6),
+        "ip" => Some(FilterPredicate::Ip(IpRange::parse(value?)?)),
+        "domain" => {
+            let name = value?;
+            let addresses = resolve_domain(name)?;
+            Some(FilterPredicate::Domain {
+                name: name.to_ascii_lowercase(),
+                addresses,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn resolve_domain(domain: &str) -> Option<Vec<IpAddr>> {
+    let addresses: Vec<IpAddr> = (domain, 0)
+        .to_socket_addrs()
+        .ok()?
+        .map(|address| address.ip())
+        .collect();
+    if addresses.is_empty() {
+        None
+    } else {
+        Some(addresses)
+    }
+}
+
+fn is_private(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_private()
+        }
+        IpAddr::V6(address) => {
+            let segment = address.segments()[0];
+            address.is_unspecified()
+                || address.is_loopback()
+                || (segment & 0xffc0) == 0xfe80
+                || (segment & 0xffc0) == 0xfec0
+        }
+    }
+}
+
+fn is_bogon(address: IpAddr, bogon: &[IpRange]) -> bool {
+    bogon.iter().any(|range| range.matches(address))
+}
+
+fn embedded_ipv4(address: IpAddr) -> Option<Ipv4Addr> {
+    match address {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(address) => address.to_ipv4(),
+    }
+}
+
+fn nat64_ipv4(address: std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = address.segments();
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0)
+    {
+        let octets = address.octets();
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection accounting
 
 #[derive(Default)]
 struct HttpState {
@@ -24,6 +342,7 @@ struct HttpState {
     body: Vec<u8>,
     pos: usize,
     closed: bool,
+    conn_id: u64,
 }
 
 struct ResponseInfo {
@@ -35,7 +354,7 @@ struct ResponseInfo {
 enum TcpStatus {
     Connecting,
     Connected,
-    Failed(String),
+    Failed,
     Closed,
 }
 
@@ -43,49 +362,200 @@ struct TcpState {
     status: TcpStatus,
     stream: Option<TcpStream>,
     eof: bool,
-    id: String,
+    failure_reported: bool,
+    notified: bool,
+    id: u64,
 }
 
-/// Process-wide counter for socket ids. OpenComputers uses a random UUID; the
-/// only observable requirement is that ids are unique and stable per handle.
-static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_socket_id() -> String {
-    let n = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-    format!("ocplay-tcp-{:016x}", n)
+enum ConnectionEntry {
+    Http(Weak<Mutex<HttpState>>),
+    Tcp(Weak<Mutex<TcpState>>),
 }
 
-/// The internet card. HTTP runs asynchronously so the machine keeps rendering
-/// while a request is in flight, exactly like the real component.
+impl ConnectionEntry {
+    fn alive(&self) -> bool {
+        match self {
+            ConnectionEntry::Http(state) => state.strong_count() > 0,
+            ConnectionEntry::Tcp(state) => state.strong_count() > 0,
+        }
+    }
+}
+
+struct ConnectionRegistry {
+    max: usize,
+    next: u64,
+    entries: HashMap<u64, ConnectionEntry>,
+}
+
+impl ConnectionRegistry {
+    fn new(max: usize) -> ConnectionRegistry {
+        ConnectionRegistry {
+            max,
+            next: 1,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn reserve(&mut self) -> Option<u64> {
+        self.entries.retain(|_, entry| entry.alive());
+        if self.entries.len() >= self.max {
+            return None;
+        }
+        let id = self.next;
+        self.next += 1;
+        Some(id)
+    }
+
+    fn insert_http(&mut self, id: u64, state: Weak<Mutex<HttpState>>) {
+        self.entries.insert(id, ConnectionEntry::Http(state));
+    }
+
+    fn insert_tcp(&mut self, id: u64, state: Weak<Mutex<TcpState>>) {
+        self.entries.insert(id, ConnectionEntry::Tcp(state));
+    }
+
+    fn release(&mut self, id: u64) {
+        self.entries.remove(&id);
+    }
+
+    fn tcp_states(&mut self) -> Vec<Arc<Mutex<TcpState>>> {
+        self.entries.retain(|_, entry| entry.alive());
+        self.entries
+            .values()
+            .filter_map(|entry| match entry {
+                ConnectionEntry::Tcp(state) => state.upgrade(),
+                ConnectionEntry::Http(_) => None,
+            })
+            .collect()
+    }
+
+    fn close_all(&mut self) {
+        let entries: Vec<ConnectionEntry> = self.entries.drain().map(|(_, entry)| entry).collect();
+        for entry in entries {
+            match entry {
+                ConnectionEntry::Http(state) => {
+                    if let Some(state) = state.upgrade() {
+                        let mut state = state.lock().unwrap();
+                        state.closed = true;
+                        state.body.clear();
+                    }
+                }
+                ConnectionEntry::Tcp(state) => {
+                    if let Some(state) = state.upgrade() {
+                        let mut state = state.lock().unwrap();
+                        if let Some(stream) = state.stream.take() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                        }
+                        state.status = TcpStatus::Closed;
+                        state.eof = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn socket_id(id: u64) -> String {
+    format!("ocplay-tcp-{:016x}", id)
+}
+
+// ---------------------------------------------------------------------------
+// Component
+
+/// The internet card. Network work runs on background threads so the machine
+/// keeps rendering while requests and connections are in flight.
 pub struct Internet {
-    pub enabled: bool,
+    pub http_enabled: bool,
+    pub tcp_enabled: bool,
     pub timeout: f64,
     pub user_agent: String,
-    pub tcp_enabled: bool,
+    pub max_read_buffer: usize,
+    filters: Arc<FilterSet>,
+    connections: Arc<Mutex<ConnectionRegistry>>,
 }
 
 impl Internet {
-    pub fn new(enabled: bool, timeout: f64, user_agent: String, tcp_enabled: bool) -> Internet {
+    pub fn new(
+        http_enabled: bool,
+        tcp_enabled: bool,
+        timeout: f64,
+        user_agent: String,
+        max_connections: usize,
+        max_read_buffer: usize,
+        filtering_rules: Vec<String>,
+    ) -> Internet {
         Internet {
-            enabled,
+            http_enabled,
+            tcp_enabled,
             timeout,
             user_agent,
-            tcp_enabled,
+            max_read_buffer,
+            filters: Arc::new(FilterSet::compile(&filtering_rules)),
+            connections: Arc::new(Mutex::new(ConnectionRegistry::new(max_connections))),
+        }
+    }
+
+    fn access_allowed(&self) -> bool {
+        (self.http_enabled || self.tcp_enabled) && !self.filters.invalid()
+    }
+
+    fn reserve(&self) -> Option<u64> {
+        self.connections.lock().unwrap().reserve()
+    }
+
+    fn register_http(&self, id: u64, state: Weak<Mutex<HttpState>>) {
+        self.connections.lock().unwrap().insert_http(id, state);
+    }
+
+    fn register_tcp(&self, id: u64, state: Weak<Mutex<TcpState>>) {
+        self.connections.lock().unwrap().insert_tcp(id, state);
+    }
+
+    fn release(&self, id: u64) {
+        self.connections.lock().unwrap().release(id);
+    }
+
+    /// Close every HTTP/TCP handle. Called when the machine stops or reboots.
+    pub fn close_all(&self) {
+        self.connections.lock().unwrap().close_all();
+    }
+
+    /// Emit `internet_ready` once per readability event for connected sockets.
+    pub fn poll_signals(&self, signals: &SignalQueue) {
+        let states = self.connections.lock().unwrap().tcp_states();
+        for state in states {
+            let mut state = state.lock().unwrap();
+            if !matches!(state.status, TcpStatus::Connected) || state.notified {
+                continue;
+            }
+            let ready = match state.stream.as_ref() {
+                Some(stream) => {
+                    let mut byte = [0u8; 1];
+                    match stream.peek(&mut byte) {
+                        Ok(_) => true,
+                        Err(error) => error.kind() != ErrorKind::WouldBlock,
+                    }
+                }
+                None => false,
+            };
+            if ready {
+                state.notified = true;
+                let signal =
+                    Signal::new("internet_ready").with(SignalArg::Str(socket_id(state.id)));
+                signals.borrow_mut().push_back(signal);
+            }
         }
     }
 
     fn connect(&self, lua: &Lua, args: &[Value]) -> mlua::Result<MultiValue> {
         let address = arg_string(args, 0)?;
-        if !self.enabled {
+        if !self.access_allowed() {
             return err(lua, "internet access is unavailable");
         }
         if !self.tcp_enabled {
             return err(lua, "tcp connections are unavailable");
         }
 
-        // `internet.socket` (OpenOS) passes the port embedded in the address,
-        // while direct callers use the second argument. An embedded port wins
-        // when both are present, matching OpenComputers' URI handling.
         let explicit_port = match args.get(1) {
             None | Some(Value::Nil) => None,
             Some(_) => Some(super::arg_int(args, 1)?),
@@ -95,33 +565,45 @@ impl Internet {
             Err(reason) => return err(lua, &reason),
         };
 
+        let conn_id = match self.reserve() {
+            Some(id) => id,
+            None => return err(lua, "too many open connections"),
+        };
         let state = Arc::new(Mutex::new(TcpState {
             status: TcpStatus::Connecting,
             stream: None,
             eof: false,
-            id: next_socket_id(),
+            failure_reported: false,
+            notified: false,
+            id: conn_id,
         }));
+        self.register_tcp(conn_id, Arc::downgrade(&state));
+
         let worker = state.clone();
+        let filters = self.filters.clone();
+        let registry = self.connections.clone();
         std::thread::spawn(move || {
-            let outcome = connect_socket(&host, port);
+            let outcome = connect_filtered(&host, port, &filters);
             let mut state = worker.lock().unwrap();
             match outcome {
-                Ok(stream) => {
-                    if matches!(state.status, TcpStatus::Closed) {
-                        // Closed while the connect was in flight: drop the
-                        // stream so the connection is torn down immediately.
-                        drop(stream);
-                    } else if let Err(reason) = stream.set_nonblocking(true) {
-                        state.status = TcpStatus::Failed(reason.to_string());
-                    } else {
-                        state.stream = Some(stream);
-                        state.status = TcpStatus::Connected;
+                Ok(stream) if !matches!(state.status, TcpStatus::Closed) => {
+                    match stream.set_nonblocking(true) {
+                        Ok(()) => {
+                            state.stream = Some(stream);
+                            state.status = TcpStatus::Connected;
+                        }
+                        Err(_) => {
+                            state.status = TcpStatus::Failed;
+                            registry.lock().unwrap().release(conn_id);
+                        }
                     }
                 }
-                Err(reason) => {
+                Ok(stream) => drop(stream),
+                Err(()) => {
                     if !matches!(state.status, TcpStatus::Closed) {
-                        state.status = TcpStatus::Failed(reason);
+                        state.status = TcpStatus::Failed;
                     }
+                    registry.lock().unwrap().release(conn_id);
                 }
             }
         });
@@ -131,43 +613,52 @@ impl Internet {
         let finish_state = state.clone();
         handle.set(
             "finishConnect",
-            lua.create_function(move |_lua, _: Variadic<Value>| {
-                let state = finish_state.lock().unwrap();
-                match &state.status {
-                    TcpStatus::Connecting => Ok(multi1(Value::Boolean(false))),
-                    TcpStatus::Connected => Ok(multi1(Value::Boolean(true))),
-                    TcpStatus::Failed(reason) => Err(mlua::Error::RuntimeError(format!(
-                        "connection failed: {}",
-                        reason
-                    ))),
-                    TcpStatus::Closed => Ok(multi1(Value::Boolean(false))),
+            lua.create_function(move |lua, _: Variadic<Value>| {
+                let mut state = finish_state.lock().unwrap();
+                if matches!(state.status, TcpStatus::Connecting) {
+                    return Ok(multi1(Value::Boolean(false)));
                 }
+                if matches!(state.status, TcpStatus::Connected) {
+                    return Ok(multi1(Value::Boolean(true)));
+                }
+                if matches!(state.status, TcpStatus::Failed) {
+                    if !state.failure_reported {
+                        state.failure_reported = true;
+                        return Ok(multi1(Value::Boolean(false)));
+                    }
+                    state.status = TcpStatus::Closed;
+                }
+                err(lua, CONNECTION_LOST)
             })?,
         )?;
 
         let read_state = state.clone();
+        let read_filters = self.max_read_buffer;
+        let read_registry = self.connections.clone();
         handle.set(
             "read",
             lua.create_function(move |lua, args: Variadic<Value>| {
                 let args = skip_self(args.as_ref());
                 let limit = match args.first() {
-                    None | Some(Value::Nil) => MAX_READ_BUFFER,
+                    None | Some(Value::Nil) => read_filters,
                     Some(_) => super::arg_int(args, 0)?.max(0) as usize,
                 }
-                .min(MAX_READ_BUFFER);
+                .min(read_filters);
 
                 let mut state = read_state.lock().unwrap();
-                match &state.status {
-                    // Still connecting: an empty string tells the caller to retry.
-                    TcpStatus::Connecting => {
-                        return Ok(multi1(Value::String(lua.create_string("")?)))
-                    }
-                    TcpStatus::Failed(reason) => return err(lua, reason),
-                    TcpStatus::Closed => return Ok(multi1(Value::Nil)),
-                    TcpStatus::Connected => {}
+                if matches!(state.status, TcpStatus::Failed) {
+                    state.status = TcpStatus::Closed;
+                    read_registry.lock().unwrap().release(state.id);
+                    return err(lua, CONNECTION_LOST);
                 }
-                if state.eof {
-                    return Ok(multi1(Value::Nil));
+                if matches!(state.status, TcpStatus::Closed) {
+                    if state.eof {
+                        return Ok(multi1(Value::Nil));
+                    }
+                    return err(lua, CONNECTION_LOST);
+                }
+                if matches!(state.status, TcpStatus::Connecting) {
+                    return Ok(multi1(Value::String(lua.create_string("")?)));
                 }
                 if limit == 0 {
                     return Ok(multi1(Value::String(lua.create_string("")?)));
@@ -180,62 +671,86 @@ impl Internet {
                 };
                 match outcome {
                     Ok(0) => {
+                        if let Some(stream) = state.stream.take() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                        }
+                        state.status = TcpStatus::Closed;
                         state.eof = true;
+                        read_registry.lock().unwrap().release(state.id);
                         Ok(multi1(Value::Nil))
                     }
-                    Ok(n) => {
-                        buffer.truncate(n);
+                    Ok(read) => {
+                        state.notified = false;
+                        buffer.truncate(read);
                         Ok(multi1(Value::String(lua.create_string(&buffer)?)))
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        state.notified = false;
                         Ok(multi1(Value::String(lua.create_string("")?)))
                     }
-                    Err(error) => {
-                        state.status = TcpStatus::Failed(error.to_string());
-                        err(lua, &error.to_string())
+                    Err(_) => {
+                        if let Some(stream) = state.stream.take() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                        }
+                        state.status = TcpStatus::Closed;
+                        read_registry.lock().unwrap().release(state.id);
+                        err(lua, CONNECTION_LOST)
                     }
                 }
             })?,
         )?;
 
         let write_state = state.clone();
+        let write_registry = self.connections.clone();
         handle.set(
             "write",
-            lua.create_function(move |_lua, args: Variadic<Value>| {
+            lua.create_function(move |lua, args: Variadic<Value>| {
                 let args = skip_self(args.as_ref());
                 let data = arg_bytes(args, 0)?;
                 let mut state = write_state.lock().unwrap();
-                if !matches!(state.status, TcpStatus::Connected) {
+                if matches!(state.status, TcpStatus::Connecting) {
                     return Ok(multi1(Value::Integer(0)));
+                }
+                if !matches!(state.status, TcpStatus::Connected) {
+                    if matches!(state.status, TcpStatus::Failed) {
+                        state.status = TcpStatus::Closed;
+                    }
+                    write_registry.lock().unwrap().release(state.id);
+                    return err(lua, CONNECTION_LOST);
                 }
                 let outcome = {
                     let stream = state.stream.as_mut().unwrap();
                     stream.write(&data)
                 };
-                let written = match outcome {
-                    Ok(n) => n,
-                    // A full send buffer is normal for a non-blocking socket;
-                    // the caller retries with the remaining bytes.
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => 0,
-                    Err(_) => 0,
-                };
-                Ok(multi1(Value::Integer(written as i64)))
+                match outcome {
+                    Ok(written) => Ok(multi1(Value::Integer(written as i64))),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        Ok(multi1(Value::Integer(0)))
+                    }
+                    Err(_) => {
+                        if let Some(stream) = state.stream.take() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                        }
+                        state.status = TcpStatus::Closed;
+                        write_registry.lock().unwrap().release(state.id);
+                        err(lua, CONNECTION_LOST)
+                    }
+                }
             })?,
         )?;
 
         let close_state = state.clone();
+        let close_registry = self.connections.clone();
         handle.set(
             "close",
             lua.create_function(move |_, _: Variadic<Value>| {
                 let mut state = close_state.lock().unwrap();
-                if matches!(state.status, TcpStatus::Closed) {
-                    return Ok(());
-                }
                 if let Some(stream) = state.stream.take() {
                     let _ = stream.shutdown(Shutdown::Both);
                 }
                 state.status = TcpStatus::Closed;
-                state.eof = true;
+                state.eof = false;
+                close_registry.lock().unwrap().release(state.id);
                 Ok(())
             })?,
         )?;
@@ -245,7 +760,9 @@ impl Internet {
             "id",
             lua.create_function(move |lua, _: Variadic<Value>| {
                 let state = id_state.lock().unwrap();
-                Ok(multi1(Value::String(lua.create_string(state.id.as_str())?)))
+                Ok(multi1(Value::String(
+                    lua.create_string(socket_id(state.id))?,
+                )))
             })?,
         )?;
 
@@ -254,12 +771,16 @@ impl Internet {
 
     fn request(&self, lua: &Lua, args: &[Value]) -> mlua::Result<MultiValue> {
         let url = arg_string(args, 0)?;
-        if !self.enabled {
+        if !self.access_allowed() {
             return err(lua, "internet access is unavailable");
         }
-        if let Err(reason) = validate_url(&url) {
-            return err(lua, &reason);
+        if !self.http_enabled {
+            return err(lua, "http requests are unavailable");
         }
+        let target = match parse_http_url(&url) {
+            Ok(target) => target,
+            Err(reason) => return err(lua, &reason),
+        };
 
         let post = match args.get(1) {
             Some(Value::String(s)) => Some(s.as_bytes().to_vec()),
@@ -271,13 +792,27 @@ impl Internet {
             _ => None,
         };
 
-        let state = Arc::new(Mutex::new(HttpState::default()));
+        let conn_id = match self.reserve() {
+            Some(id) => id,
+            None => return err(lua, "too many open connections"),
+        };
+        let state = Arc::new(Mutex::new(HttpState {
+            conn_id,
+            ..HttpState::default()
+        }));
+        self.register_http(conn_id, Arc::downgrade(&state));
+
         let worker = state.clone();
         let timeout = self.timeout;
         let user_agent = self.user_agent.clone();
         let url_owned = url.clone();
+        let filters = self.filters.clone();
+        let registry = self.connections.clone();
         std::thread::spawn(move || {
-            let outcome = perform_request(&url_owned, method, post, headers, timeout, &user_agent);
+            let outcome = match check_host_allowed(&target.host, target.port, &filters) {
+                Ok(()) => perform_request(&url_owned, method, post, headers, timeout, &user_agent),
+                Err(reason) => Err(reason),
+            };
             let mut state = worker.lock().unwrap();
             state.done = true;
             match outcome {
@@ -291,17 +826,24 @@ impl Internet {
                     state.response = Some(info);
                     state.body = body;
                 }
-                Err(reason) => state.error = Some(reason),
+                Err(reason) => {
+                    state.error = Some(reason);
+                    registry.lock().unwrap().release(conn_id);
+                }
             }
         });
 
         let handle = lua.create_table()?;
 
         let read_state = state.clone();
+        let read_limit = self.max_read_buffer;
         handle.set(
             "read",
             lua.create_function(move |lua, n: Option<i64>| {
                 let mut state = read_state.lock().unwrap();
+                if state.closed {
+                    return err(lua, CONNECTION_LOST);
+                }
                 if let Some(reason) = &state.error {
                     return err(lua, reason);
                 }
@@ -313,7 +855,7 @@ impl Internet {
                     return Ok(multi1(Value::Nil));
                 }
                 let limit = n.unwrap_or(i64::MAX).max(0) as usize;
-                let limit = limit.min(MAX_READ_BUFFER);
+                let limit = limit.min(read_limit);
                 let end = (state.pos + limit).min(state.body.len());
                 let chunk = state.body[state.pos..end].to_vec();
                 state.pos = end;
@@ -352,6 +894,9 @@ impl Internet {
             "finishConnect",
             lua.create_function(move |lua, ()| {
                 let state = finish_state.lock().unwrap();
+                if state.closed {
+                    return err(lua, CONNECTION_LOST);
+                }
                 if let Some(reason) = &state.error {
                     return err(lua, reason);
                 }
@@ -359,12 +904,14 @@ impl Internet {
             })?,
         )?;
 
+        let close_registry = self.connections.clone();
         handle.set(
             "close",
             lua.create_function(move |_, ()| {
                 let mut state = state.lock().unwrap();
                 state.closed = true;
                 state.body.clear();
+                close_registry.lock().unwrap().release(state.conn_id);
                 Ok(())
             })?,
         )?;
@@ -388,7 +935,7 @@ impl Component for Internet {
 
     fn invoke(&self, lua: &Lua, method: &str, args: &[Value]) -> mlua::Result<MultiValue> {
         match method {
-            "isHttpEnabled" => Ok(multi1(Value::Boolean(self.enabled))),
+            "isHttpEnabled" => Ok(multi1(Value::Boolean(self.http_enabled))),
             "isTcpEnabled" => Ok(multi1(Value::Boolean(self.tcp_enabled))),
             "request" => self.request(lua, args),
             "connect" => self.connect(lua, args),
@@ -415,7 +962,7 @@ const METHODS: &[MethodInfo] = &[
 
 // ---------------------------------------------------------------------------
 
-fn err<'a>(lua: &'a Lua, reason: &str) -> mlua::Result<MultiValue> {
+fn err(lua: &Lua, reason: &str) -> mlua::Result<MultiValue> {
     let mut out = MultiValue::new();
     out.push_back(Value::Nil);
     out.push_back(Value::String(lua.create_string(reason)?));
@@ -432,63 +979,76 @@ fn skip_self(args: &[Value]) -> &[Value] {
     }
 }
 
-const ADDRESS_PARSE_ERROR: &str = "address could not be parsed or no valid port given";
-
-/// Parse the `connect` address forms accepted by OpenComputers:
-/// `host` + explicit port, `host:port`, and bracketed IPv6 (`[::1]:port`).
-/// A bare IPv6 literal is accepted only with an explicit port argument.
+/// Mirror OC's `checkUri` where practical: accept URI schemes, `host:port`,
+/// `host/path` plus an explicit port, and bracketed IPv6. An embedded port wins.
+/// A bare IPv6 literal is rejected because Java's URI parser treats it as a
+/// scheme/host ambiguity, so OC rejects it too.
 fn parse_endpoint(address: &str, explicit_port: Option<i64>) -> Result<(String, u16), String> {
     if address.is_empty() {
         return Err(ADDRESS_PARSE_ERROR.into());
     }
-    let address = address.strip_prefix("oc://").unwrap_or(address);
-    if address.contains("://") {
-        return Err("unsupported protocol".into());
-    }
-    if address.is_empty() {
+    let address = match address.split_once("://") {
+        Some((scheme, rest)) => {
+            let valid = !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+            if !valid || rest.is_empty() {
+                return Err("invalid address".into());
+            }
+            rest
+        }
+        None => address,
+    };
+
+    let authority_end = address.find(['/', '?', '#']).unwrap_or(address.len());
+    let authority = &address[..authority_end];
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
         return Err(ADDRESS_PARSE_ERROR.into());
     }
 
-    if let Some(rest) = address.strip_prefix('[') {
+    if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest
             .split_once(']')
             .ok_or_else(|| "invalid address".to_string())?;
+        if host.parse::<Ipv6Addr>().is_err() {
+            return Err("invalid address".into());
+        }
         validate_host(host)?;
-        if after.is_empty() {
-            let port = explicit_port
+        let port = if let Some(port_text) = after.strip_prefix(':') {
+            parse_port(port_text)?
+        } else if after.is_empty() {
+            explicit_port
                 .map(checked_port)
                 .transpose()?
-                .ok_or_else(|| ADDRESS_PARSE_ERROR.to_string())?;
-            return Ok((host.to_string(), port));
-        }
-        let port_text = after
-            .strip_prefix(':')
-            .ok_or_else(|| "invalid address".to_string())?;
-        return Ok((host.to_string(), parse_port(port_text)?));
+                .ok_or_else(|| ADDRESS_PARSE_ERROR.to_string())?
+        } else {
+            return Err("invalid address".into());
+        };
+        return Ok((host.to_string(), port));
     }
 
-    let colons = address.matches(':').count();
-    if colons >= 2 {
-        // Bare IPv6 literal; an embedded port requires brackets.
-        validate_host(address)?;
-        let port = explicit_port
+    let colons = authority.matches(':').count();
+    if colons > 1 {
+        // Bare IPv6 literal; OC's URI parser does not accept it.
+        return Err(ADDRESS_PARSE_ERROR.into());
+    }
+    let (host, embedded_port) = if colons == 1 {
+        let (host, port_text) = authority.split_once(':').unwrap();
+        (host, Some(parse_port(port_text)?))
+    } else {
+        (authority, None)
+    };
+    validate_host(host)?;
+    let port = match embedded_port {
+        Some(port) => port,
+        None => explicit_port
             .map(checked_port)
             .transpose()?
-            .ok_or_else(|| ADDRESS_PARSE_ERROR.to_string())?;
-        return Ok((address.to_string(), port));
-    }
-    if colons == 1 {
-        let (host, port_text) = address.split_once(':').unwrap();
-        validate_host(host)?;
-        return Ok((host.to_string(), parse_port(port_text)?));
-    }
-
-    validate_host(address)?;
-    let port = explicit_port
-        .map(checked_port)
-        .transpose()?
-        .ok_or_else(|| ADDRESS_PARSE_ERROR.to_string())?;
-    Ok((address.to_string(), port))
+            .ok_or_else(|| ADDRESS_PARSE_ERROR.to_string())?,
+    };
+    Ok((host.to_string(), port))
 }
 
 fn validate_host(host: &str) -> Result<(), String> {
@@ -514,40 +1074,79 @@ fn checked_port(value: i64) -> Result<u16, String> {
     }
 }
 
-/// Resolve and connect on the worker thread. `connect_timeout` bounds the
-/// handshake (and is applied to each candidate address until the deadline).
-fn connect_socket(host: &str, port: u16) -> Result<TcpStream, String> {
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("could not resolve {}: {}", host, error))?;
+/// Resolve and connect on the worker thread, skipping addresses that the
+/// filtering rules deny. The 10 second deadline covers all candidates.
+fn connect_filtered(host: &str, port: u16, filters: &FilterSet) -> Result<TcpStream, ()> {
+    let addresses: Vec<SocketAddr> = (host, port).to_socket_addrs().map_err(|_| ())?.collect();
+    if addresses.is_empty() {
+        return Err(());
+    }
     let deadline = Instant::now() + TCP_CONNECT_TIMEOUT;
-    let mut saw_address = false;
-    let mut last_error = None;
     for address in addresses {
-        saw_address = true;
+        if !filters.is_allowed(address.ip(), host) {
+            continue;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            last_error = Some("connection timed out".to_string());
             break;
         }
-        match TcpStream::connect_timeout(&address, remaining) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error.to_string()),
+        if let Ok(stream) = TcpStream::connect_timeout(&address, remaining) {
+            return Ok(stream);
         }
     }
-    if !saw_address {
-        return Err("could not resolve address".into());
-    }
-    Err(last_error.unwrap_or_else(|| "connection failed".into()))
+    Err(())
 }
 
-fn validate_url(url: &str) -> Result<(), String> {
-    match url.find("://") {
-        Some(index) => match url[..index].to_ascii_lowercase().as_str() {
-            "http" | "https" => Ok(()),
-            _ => Err("unsupported protocol".into()),
-        },
-        None => Err("invalid address".into()),
+#[derive(Debug)]
+struct HttpTarget {
+    host: String,
+    port: u16,
+}
+
+fn parse_http_url(url: &str) -> Result<HttpTarget, String> {
+    let uri: ureq::http::Uri = url.parse().map_err(|_| "invalid address".to_string())?;
+    let scheme = uri.scheme_str().unwrap_or("");
+    if scheme.is_empty() {
+        return Err("invalid address".into());
+    }
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err("unsupported protocol".into());
+    }
+    let host = uri.host().ok_or_else(|| "invalid address".to_string())?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return Err("invalid address".into());
+    }
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme.eq_ignore_ascii_case("https") {
+            443
+        } else {
+            80
+        });
+    Ok(HttpTarget {
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn check_host_allowed(host: &str, port: u16, filters: &FilterSet) -> Result<(), String> {
+    let addresses: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "could not resolve host".to_string())?
+        .collect();
+    if addresses.is_empty() {
+        return Err("could not resolve host".into());
+    }
+    // HTTP is resolved again by the HTTP client, so require every candidate to
+    // be allowed to avoid falling back to a denied address.
+    if addresses
+        .iter()
+        .all(|address| filters.is_allowed(address.ip(), host))
+    {
+        Ok(())
+    } else {
+        Err("address is not allowed".into())
     }
 }
 
@@ -598,8 +1197,7 @@ fn perform_request(
     });
     let body = post.unwrap_or_default();
 
-    let method =
-        ureq::http::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let method = ureq::http::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let mut builder = ureq::http::Request::builder().method(method).uri(url);
     for (name, value) in &headers {
         builder = builder.header(name.as_str(), value.as_str());
@@ -638,27 +1236,178 @@ fn perform_request(
 mod tests {
     use super::*;
 
+    fn rules(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn default_rules() -> Vec<String> {
+        DEFAULT_FILTERING_RULES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn default_rules_deny_loopback_and_allow_public() {
+        let filters = FilterSet::compile(&default_rules());
+        assert!(!filters.invalid());
+        assert_eq!(filters.bogon.len(), BOGON_RANGES.len());
+        assert!(!filters.is_allowed("127.0.0.1".parse().unwrap(), "127.0.0.1"));
+        assert!(!filters.is_allowed("::1".parse().unwrap(), "::1"));
+        assert!(!filters.is_allowed("::ffff:127.0.0.1".parse().unwrap(), "::ffff:127.0.0.1"));
+        assert!(filters.is_allowed("1.1.1.1".parse().unwrap(), "1.1.1.1"));
+    }
+
+    #[test]
+    fn allow_rule_permits_loopback_and_first_match_wins() {
+        let filters = FilterSet::compile(&rules(&["allow ip:127.0.0.1/8", "deny all"]));
+        assert!(filters.is_allowed("127.0.0.1".parse().unwrap(), "127.0.0.1"));
+
+        let allow_first = FilterSet::compile(&rules(&["allow all", "deny all"]));
+        assert!(allow_first.is_allowed("127.0.0.1".parse().unwrap(), "127.0.0.1"));
+
+        let deny_first = FilterSet::compile(&rules(&["deny all", "allow all"]));
+        assert!(!deny_first.is_allowed("127.0.0.1".parse().unwrap(), "127.0.0.1"));
+    }
+
+    #[test]
+    fn no_match_denies_and_invalid_rules_disable_access() {
+        let no_match = FilterSet::compile(&rules(&["allow ip:10.0.0.0/8"]));
+        assert!(!no_match.is_allowed("1.1.1.1".parse().unwrap(), "1.1.1.1"));
+
+        let invalid = FilterSet::compile(&rules(&["allow ip:not-an-ip"]));
+        assert!(invalid.invalid());
+        assert!(!invalid.is_allowed("1.1.1.1".parse().unwrap(), "1.1.1.1"));
+
+        let disabled = Internet::new(
+            true,
+            true,
+            0.0,
+            "test".into(),
+            4,
+            2048,
+            rules(&["allow ip:not-an-ip"]),
+        );
+        assert!(!disabled.access_allowed());
+
+        let tcp_only = Internet::new(
+            false,
+            true,
+            0.0,
+            "test".into(),
+            4,
+            2048,
+            rules(&["allow all"]),
+        );
+        assert!(tcp_only.access_allowed());
+        assert!(!tcp_only.http_enabled);
+        assert!(tcp_only.tcp_enabled);
+    }
+
+    #[test]
+    fn http_filtering_uses_the_same_rules() {
+        let denied = FilterSet::compile(&default_rules());
+        assert_eq!(
+            check_host_allowed("127.0.0.1", 80, &denied).unwrap_err(),
+            "address is not allowed"
+        );
+
+        let allowed = FilterSet::compile(&rules(&["allow ip:127.0.0.1/8"]));
+        assert!(check_host_allowed("127.0.0.1", 80, &allowed).is_ok());
+    }
+
+    #[test]
+    fn predicate_families_match() {
+        let filters = FilterSet::compile(&rules(&[
+            "allow ip:127.0.0.1/8",
+            "allow ipv4",
+            "allow bogon",
+            "allow private",
+            "allow domain:localhost",
+            "allow default",
+        ]));
+        assert!(!filters.invalid());
+        let ipv6: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(filters.is_allowed(ipv6, "dns.google"));
+    }
+
+    #[test]
+    fn connection_registry_limit_releases_slots() {
+        let mut registry = ConnectionRegistry::new(2);
+        let http_state = Arc::new(Mutex::new(HttpState::default()));
+        let tcp_state = Arc::new(Mutex::new(TcpState {
+            status: TcpStatus::Connecting,
+            stream: None,
+            eof: false,
+            failure_reported: false,
+            notified: false,
+            id: 0,
+        }));
+        let first = registry.reserve().unwrap();
+        registry.insert_http(first, Arc::downgrade(&http_state));
+        let second = registry.reserve().unwrap();
+        registry.insert_tcp(second, Arc::downgrade(&tcp_state));
+        assert!(registry.reserve().is_none());
+        registry.release(first);
+        assert!(registry.reserve().is_some());
+    }
+
+    #[test]
+    fn close_all_drops_socket_streams() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let state = Arc::new(Mutex::new(TcpState {
+            status: TcpStatus::Connected,
+            stream: Some(client),
+            eof: false,
+            failure_reported: false,
+            notified: false,
+            id: 1,
+        }));
+        let mut registry = ConnectionRegistry::new(4);
+        let id = registry.reserve().unwrap();
+        registry.insert_tcp(id, Arc::downgrade(&state));
+
+        registry.close_all();
+
+        {
+            let state = state.lock().unwrap();
+            assert!(matches!(&state.status, TcpStatus::Closed));
+            assert!(state.stream.is_none());
+        }
+        let mut buffer = [0u8; 1];
+        assert_eq!(server.read(&mut buffer).unwrap(), 0);
+    }
+
     #[test]
     fn accepts_http_and_https() {
-        assert!(validate_url("http://example.com").is_ok());
-        assert!(validate_url("https://example.com/path?q=1").is_ok());
-        assert!(validate_url("HTTP://example.com").is_ok());
+        assert!(parse_http_url("http://example.com").is_ok());
+        assert!(parse_http_url("https://example.com/path?q=1").is_ok());
+        assert!(parse_http_url("HTTP://example.com").is_ok());
     }
 
     #[test]
     fn rejects_other_schemes_and_garbage() {
         assert_eq!(
-            validate_url("ftp://example.com").unwrap_err(),
+            parse_http_url("ftp://example.com").unwrap_err(),
             "unsupported protocol"
         );
         assert_eq!(
-            validate_url("example.com/no/scheme").unwrap_err(),
+            parse_http_url("example.com/no/scheme").unwrap_err(),
             "invalid address"
         );
     }
 
     #[test]
-    fn parses_hostname_and_ipv4_endpoints() {
+    fn parses_address_matrix() {
         assert_eq!(
             parse_endpoint("example.com", Some(80)).unwrap(),
             ("example.com".to_string(), 80)
@@ -667,27 +1416,30 @@ mod tests {
             parse_endpoint("example.com:8080", None).unwrap(),
             ("example.com".to_string(), 8080)
         );
-        assert_eq!(
-            parse_endpoint("127.0.0.1", Some(25565)).unwrap(),
-            ("127.0.0.1".to_string(), 25565)
-        );
-        // An embedded port wins over the explicit argument, matching OC's URI
-        // handling in checkUri.
+        // Embedded ports win over the explicit argument.
         assert_eq!(
             parse_endpoint("127.0.0.1:9000", Some(25565)).unwrap(),
             ("127.0.0.1".to_string(), 9000)
         );
         assert_eq!(
+            parse_endpoint("http://example.com", Some(80)).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            parse_endpoint("https://example.com:443", None).unwrap(),
+            ("example.com".to_string(), 443)
+        );
+        assert_eq!(
+            parse_endpoint("http://example.com:8080/path?q=1", None).unwrap(),
+            ("example.com".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_endpoint("example.com/path", Some(80)).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
             parse_endpoint("oc://example.com:25", None).unwrap(),
             ("example.com".to_string(), 25)
-        );
-    }
-
-    #[test]
-    fn parses_ipv6_endpoints() {
-        assert_eq!(
-            parse_endpoint("::1", Some(80)).unwrap(),
-            ("::1".to_string(), 80)
         );
         assert_eq!(
             parse_endpoint("[::1]:8080", None).unwrap(),
@@ -697,22 +1449,21 @@ mod tests {
             parse_endpoint("[::1]", Some(80)).unwrap(),
             ("::1".to_string(), 80)
         );
-        assert_eq!(
-            parse_endpoint("[2001:db8::5]:443", None).unwrap(),
-            ("2001:db8::5".to_string(), 443)
-        );
-        assert!(parse_endpoint("::1", None).is_err());
     }
 
     #[test]
-    fn rejects_invalid_endpoints() {
+    fn rejects_invalid_addresses() {
         assert_eq!(
             parse_endpoint("example.com", None).unwrap_err(),
-            "address could not be parsed or no valid port given"
+            ADDRESS_PARSE_ERROR
+        );
+        assert_eq!(
+            parse_endpoint("::1", Some(80)).unwrap_err(),
+            ADDRESS_PARSE_ERROR
         );
         assert_eq!(
             parse_endpoint("", Some(80)).unwrap_err(),
-            "address could not be parsed or no valid port given"
+            ADDRESS_PARSE_ERROR
         );
         assert_eq!(
             parse_endpoint("example.com:0", None).unwrap_err(),
@@ -726,10 +1477,14 @@ mod tests {
             parse_endpoint("example.com:http", None).unwrap_err(),
             "invalid port"
         );
+        assert_eq!(
+            parse_endpoint("http://example.com:80", Some(80)).unwrap(),
+            ("example.com".to_string(), 80)
+        );
         assert_eq!(parse_endpoint("[::1]:", None).unwrap_err(), "invalid port");
         assert_eq!(
-            parse_endpoint("http://example.com:80", None).unwrap_err(),
-            "unsupported protocol"
+            parse_endpoint("[bad]:80", None).unwrap_err(),
+            "invalid address"
         );
         assert_eq!(
             parse_endpoint("bad host", Some(80)).unwrap_err(),

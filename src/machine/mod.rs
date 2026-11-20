@@ -2,6 +2,7 @@
 
 pub mod host_api;
 
+use crate::components::internet::Internet;
 use crate::components::keyboard::Keyboard;
 use crate::components::screen::{Screen, SharedBuffer};
 use crate::components::{Registry, SignalQueue};
@@ -23,6 +24,7 @@ pub struct Host {
     pub screen: SharedBuffer,
     pub screen_component: Rc<Screen>,
     pub keyboard: Rc<Keyboard>,
+    pub internet: Rc<Internet>,
     pub users: Rc<RefCell<Vec<String>>>,
 }
 
@@ -61,10 +63,7 @@ impl Machine {
         // proxies exposed by the machine sandbox.
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         host_api::install(&lua, host.clone())?;
-        let func = lua
-            .load(machine_src)
-            .set_name("=machine")
-            .into_function()?;
+        let func = lua.load(machine_src).set_name("=machine").into_function()?;
         let thread = lua.create_thread(func)?;
         Ok(Machine { lua, thread, host })
     }
@@ -79,26 +78,24 @@ impl Machine {
                 Ok(values) => values,
             };
             if self.thread.is_finished() {
-                let success = matches!(values.get(0), Some(Value::Boolean(true)));
+                let success = matches!(values.front(), Some(Value::Boolean(true)));
                 let message = values
                     .get(1)
                     .filter(|v| !v.is_nil())
                     .and_then(|v| v.to_string().ok());
                 return Step::Finished(success, message);
             }
-            match values.get(0) {
+            match values.front() {
                 // `machine.lua` yields a host callback for non-direct component
                 // methods; run it and resume the coroutine with its result.
-                Some(Value::Function(function)) => {
-                    match function.call::<Value>(()) {
-                        Ok(value) => {
-                            let mut next = MultiValue::new();
-                            next.push_back(value);
-                            resume = next;
-                        }
-                        Err(error) => return Step::Finished(false, Some(error.to_string())),
+                Some(Value::Function(function)) => match function.call::<Value>(()) {
+                    Ok(value) => {
+                        let mut next = MultiValue::new();
+                        next.push_back(value);
+                        resume = next;
                     }
-                }
+                    Err(error) => return Step::Finished(false, Some(error.to_string())),
+                },
                 Some(Value::Integer(i)) => return Step::Sleep(*i as f64),
                 Some(Value::Number(n)) => return Step::Sleep(*n),
                 Some(Value::Boolean(b)) => return Step::Shutdown(*b),

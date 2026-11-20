@@ -150,10 +150,22 @@ has a default, so an empty file `{}` is valid. Full example:
                              # (mouse capture is enabled only in --interactive)
 
     internet:
-      enabled: true          # default true; false makes request() fail
-      timeout: 30            # seconds; 0 = no timeout (default 0)
-      tcp: false             # TCP via component.internet.connect (default false)
+      # Canonical names: enableHttp/enableTcp. `enabled`/`tcp` are aliases.
+      enabled: true          # alias for enableHttp (default true)
+      tcp: true              # alias for enableTcp (default true)
+      timeout: 30            # HTTP seconds; 0 = no timeout (default 0)
+      filteringRules:        # first match wins; no match denies
+        - removeme
+        - deny private
+        - deny bogon
+        - allow default
+      maxTcpConnections: 4   # HTTP + TCP per card
+      maxReadBuffer: 2048    # bytes per read call
       userAgent: opencomputers/ocplay   # default User-Agent header
+
+    `enabled`/`tcp` are aliases for `enableHttp`/`enableTcp`. They are
+    independent; `enabled: false` only disables HTTP, so set both to false to
+    disable all access.
 
     run:
       script: test.lua       # optional default script path
@@ -299,25 +311,35 @@ Behavior notes:
     - `read` on a response with status >= 400 fails (OpenComputers never exposes
       the error stream), but `response()` still reports the status and headers.
     - Response headers are returned as a table mapping name -> array of strings.
+    - HTTP and TCP are subject to filteringRules. Defaults deny private/bogon
+      addresses, including 127.0.0.1. For local tests add
+      "allow ip:127.0.0.1/8" (or "allow all") to filteringRules.
 
-TCP sockets (requires `internet.tcp: true`):
+TCP sockets (requires enableTcp, aliased by `tcp`; default true):
 
     local socket, reason = component.internet.connect("example.com", 80)
-    -- address may also be "host:port", "[ipv6]:port", or a bare IPv6 literal
-    -- when the port is passed as the second argument.
+    -- also: "host:port", "http://host:port", and "[::1]:port".
+    -- An embedded port wins. Bare IPv6 literals are rejected.
 
-    socket:finishConnect()    -> false while connecting, true when connected,
-                                 errors if the connection failed/timed out (10s)
-    socket:read([n])          -> up to min(n, 2048) bytes; "" when no data yet;
-                                 nil at EOF or after close()
-    socket:write(data)        -> bytes accepted (0 when the send buffer is full);
-                                 retry with the remainder
-    socket:close()            -> idempotent
-    socket:id()               -> stable unique connection id
+    socket.finishConnect()    -> false while connecting, true when connected;
+                                 false once then nil,"connection lost" on
+                                 failure; nil,"connection lost" after close
+    socket.read([n])          -> up to maxReadBuffer bytes; "" while connecting
+                                 or when no data; nil at EOF;
+                                 nil,"connection lost" after close/error
+    socket.write(data)        -> bytes accepted (0 while connecting/backpressure);
+                                 nil,reason after close/error
+    socket.close()            -> idempotent
+    socket.id()               -> stable unique connection id
+
+    Signals: "internet_ready", <id> is emitted when a socket becomes readable.
+    Limits: maxTcpConnections (default 4) is shared by HTTP and TCP handles;
+    a full card returns nil,"too many open connections". Sockets are closed on
+    machine shutdown/reboot.
 
     The OpenOS wrappers `internet.socket(address, port)` and
-    `internet.open(address, port)` are also supported. TCP is raw: no TLS,
-    proxies, address filtering, or `internet_ready` signals (poll read instead).
+    `internet.open(address, port)` are supported, but they busy-spin on write
+    returning 0 and do not poll finishConnect. TCP is raw: no TLS or proxies.
 
 ================================================================================
 9. MOUSE / TOUCH
@@ -371,8 +393,9 @@ Run them:
 Unit tests cover config parsing, URL validation, the mouse->signal mapping,
 screen signal emission, and the Ctrl+C host-quit logic (plain Ctrl+C quits,
 Ctrl+Alt+C is left for the guest). End-to-end tests run the compiled binary to
-boot OpenOS, run a script, perform an HTTP GET against a local server, check that
-script arguments arrive, and check the missing-root-filesystem error.
+boot OpenOS, run a script, perform an HTTP GET against a local server, exercise
+TCP echo/filtering/connection-limit/`internet_ready`, check that script arguments
+arrive, and check the missing-root-filesystem error.
 
 ================================================================================
 12. LIMITATIONS / UNPLANNED
@@ -382,7 +405,7 @@ script arguments arrive, and check the missing-root-filesystem error.
       drone, tablet, server, geolyzer, motion_sensor, transposer, trading, sign,
       navigation, piston, leash, database, experience, generator, crafting,
       debug, and all upgrades.
-    - Internet: no TCP, proxies, or address filtering rules.
+    - Internet: no proxies, OC `http_response` signals, or TLS for TCP.
     - GPU: no VRAM buffers (allocateBuffer/freeBuffer/bitblt).
     - Filesystem: integer handles instead of userdata; no persistence (session
       temp dir); approximate space accounting.

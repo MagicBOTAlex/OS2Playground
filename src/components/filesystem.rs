@@ -304,7 +304,8 @@ fn open_file(path: &Path, mode: &str, readonly: bool) -> mlua::Result<fs::File> 
         return Err(mlua::Error::RuntimeError("filesystem is readonly".into()));
     }
     if read {
-        return fs::File::open(path).map_err(|_| mlua::Error::RuntimeError("file not found".into()));
+        return fs::File::open(path)
+            .map_err(|_| mlua::Error::RuntimeError("file not found".into()));
     }
     let mut options = fs::OpenOptions::new();
     options.create(true).write(true);

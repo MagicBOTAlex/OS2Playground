@@ -27,11 +27,20 @@ components:
   mouse: true
 
 internet:
+  # Canonical flags are enableHttp/enableTcp; `enabled`/`tcp` are aliases.
   enabled: true
   # HTTP request timeout in seconds; 0 = no timeout.
   timeout: 30
-  # TCP connections via component.internet.connect (disabled by default).
-  tcp: false
+  # TCP connections via component.internet.connect (default true).
+  tcp: true
+  # Default OC rules deny loopback/private; add an allow rule for local tests.
+  filteringRules:
+    - removeme
+    - deny private
+    - deny bogon
+    - allow default
+  maxTcpConnections: 4
+  maxReadBuffer: 2048
   userAgent: opencomputers/ocplay
 
 run:

@@ -55,9 +55,7 @@ fn install_component(lua: &Lua, host: &Rc<Host>) -> mlua::Result<()> {
                         match registry.find(&address) {
                             Some(entry) => entry.component.clone(),
                             None => {
-                                return Err(mlua::Error::RuntimeError(
-                                    "no such component".into(),
-                                ))
+                                return Err(mlua::Error::RuntimeError("no such component".into()))
                             }
                         }
                     };
@@ -131,20 +129,17 @@ fn install_computer(lua: &Lua, host: &Rc<Host>) -> mlua::Result<()> {
     }
     {
         let host = host.clone();
-        computer.set("realTime", lua.create_function(move |_, ()| Ok(host.now()))?)?;
+        computer.set(
+            "realTime",
+            lua.create_function(move |_, ()| Ok(host.now()))?,
+        )?;
     }
     {
         let host = host.clone();
         computer.set("uptime", lua.create_function(move |_, ()| Ok(host.now()))?)?;
     }
-    computer.set(
-        "energy",
-        lua.create_function(|_, ()| Ok(100000.0f64))?,
-    )?;
-    computer.set(
-        "maxEnergy",
-        lua.create_function(|_, ()| Ok(100000.0f64))?,
-    )?;
+    computer.set("energy", lua.create_function(|_, ()| Ok(100000.0f64))?)?;
+    computer.set("maxEnergy", lua.create_function(|_, ()| Ok(100000.0f64))?)?;
     {
         let host = host.clone();
         computer.set(
@@ -262,10 +257,7 @@ fn install_computer(lua: &Lua, host: &Rc<Host>) -> mlua::Result<()> {
 
 fn install_system(lua: &Lua, host: &Rc<Host>) -> mlua::Result<()> {
     let system = lua.create_table()?;
-    system.set(
-        "allowBytecode",
-        lua.create_function(|_, ()| Ok(true))?,
-    )?;
+    system.set("allowBytecode", lua.create_function(|_, ()| Ok(true))?)?;
     system.set("allowGC", lua.create_function(|_, ()| Ok(false))?)?;
     {
         let host = host.clone();
@@ -311,14 +303,15 @@ fn install_unicode(lua: &Lua) -> mlua::Result<()> {
     )?;
     unicode.set(
         "sub",
-        lua.create_function(|_, (s, i, j): (String, i64, Option<i64>)| {
-            Ok(unicode_sub(&s, i, j))
-        })?,
+        lua.create_function(|_, (s, i, j): (String, i64, Option<i64>)| Ok(unicode_sub(&s, i, j)))?,
     )?;
     unicode.set(
         "isWide",
         lua.create_function(|_, s: String| {
-            Ok(s.chars().next().map(|c| wcwidth(c as u32) > 1).unwrap_or(false))
+            Ok(s.chars()
+                .next()
+                .map(|c| wcwidth(c as u32) > 1)
+                .unwrap_or(false))
         })?,
     )?;
     unicode.set(
@@ -330,7 +323,9 @@ fn install_unicode(lua: &Lua) -> mlua::Result<()> {
     unicode.set(
         "wlen",
         lua.create_function(|_, s: String| {
-            Ok(s.chars().map(|c| wcwidth(c as u32).max(1) as i64).sum::<i64>())
+            Ok(s.chars()
+                .map(|c| wcwidth(c as u32).max(1) as i64)
+                .sum::<i64>())
         })?,
     )?;
     unicode.set(
@@ -380,7 +375,9 @@ fn install_userdata(lua: &Lua) -> mlua::Result<()> {
     // The emulator never hands userdata to Lua, so these stubs are inert.
     let userdata = lua.create_table()?;
     let unsupported = lua.create_function(|_, _: Variadic<Value>| {
-        Err::<Value, _>(mlua::Error::RuntimeError("userdata is not supported".into()))
+        Err::<Value, _>(mlua::Error::RuntimeError(
+            "userdata is not supported".into(),
+        ))
     })?;
     for name in [
         "methods", "invoke", "doc", "apply", "unapply", "call", "save", "load", "dispose",
